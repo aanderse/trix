@@ -14,4 +14,7 @@ use_trix() {
   watch_file flake.lock
   local flake_ref="${1:-.}"
   direnv_load trix develop "$flake_ref" -c "$(join_args "$direnv" dump)"
+  # Unset TMPDIR and related variables - nix-shell sets these to a session-specific
+  # temp directory that gets cleaned up when nix-shell exits, leaving a stale path
+  unset TMPDIR TEMP TEMPDIR TMP NIX_BUILD_TOP
 }

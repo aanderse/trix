@@ -2,3 +2,8 @@ __pycache__
 .claude
 .direnv
 result
+
+
+# Added by cargo
+
+/target
