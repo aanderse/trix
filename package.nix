@@ -1,58 +1,49 @@
 {
   lib,
-  python3Packages,
+  rustPlatform,
+  versionCheckHook,
 }:
 
-let
-  fs = lib.fileset;
-  sourceFiles = fs.difference
-    (fs.unions [
-      ./pyproject.toml
-      ./src
-      ./nix
-      ./direnvrc
-    ])
-    # Exclude .pyc files (contents of __pycache__ directories)
-    (fs.fileFilter (file: file.hasExt "pyc") ./src);
-in
-
-python3Packages.buildPythonApplication {
+rustPlatform.buildRustPackage {
   pname = "trix";
-  version = "0.1.0";
-  pyproject = true;
+  version = "0.2.0";
 
-  src = fs.toSource {
+  src = lib.fileset.toSource {
     root = ./.;
-    fileset = sourceFiles;
+    fileset = lib.fileset.unions [
+      ./Cargo.toml
+      ./Cargo.lock
+      ./tests
+      ./src
+      ./direnvrc
+    ];
   };
 
-  build-system = [ python3Packages.hatchling ];
+  cargoHash = "sha256-VCAfIvHR9Z4yXb7BwuaIQt6r6jP0RTxyhSKrQo54nhw=";
 
-  dependencies = [ python3Packages.click ];
+  dontUseCargoParallelTests = true;
 
-  nativeCheckInputs = [ python3Packages.pytest ];
-
-  # Tests require nix commands
   doCheck = false;
 
   postInstall = ''
-    mkdir -p $out/share/trix
-    cp -r nix $out/share/trix/
+    mkdir -p $out/share/trix/nix
+    cp src/resources/*.nix $out/share/trix/nix/
     cp direnvrc $out/share/trix/
-
-    # Shell completions
-    mkdir -p $out/share/bash-completion/completions
-    mkdir -p $out/share/zsh/site-functions
-    mkdir -p $out/share/fish/vendor_completions.d
-    $out/bin/trix completion bash > $out/share/bash-completion/completions/trix
-    $out/bin/trix completion zsh > $out/share/zsh/site-functions/_trix
-    $out/bin/trix completion fish > $out/share/fish/vendor_completions.d/trix.fish
   '';
+
+  doInstallCheck = true;
+  nativeInstallCheckInputs = [ versionCheckHook ];
+  versionCheckProgramArg = "--version";
 
   meta = {
     description = "trick yourself into flakes";
     homepage = "https://github.com/aanderse/trix";
     license = lib.licenses.mit;
     mainProgram = "trix";
+    maintainers = with lib.maintainers; [
+      aanderse
+      drupol
+    ];
+    platforms = lib.platforms.all;
   };
 }

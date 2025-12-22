@@ -2,15 +2,11 @@
   description = "trick yourself into flakes";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
+    nixpkgs.url = "github:/nixos/nixpkgs/nixos-unstable";
   };
 
   outputs =
-    {
-      self,
-      nixpkgs,
-      ...
-    }:
+    { self, nixpkgs }:
     let
       supportedSystems = [
         "x86_64-linux"
@@ -36,28 +32,20 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          python = pkgs.python3.withPackages (p: [
-            p.click
-            p.pytest
-          ]);
-          # Create a wrapper script that calls trix via python -m
-          trixWrapper = pkgs.writeShellScriptBin "trix" ''
-            exec ${python}/bin/python -m trix.cli "$@"
-          '';
         in
         {
           default = pkgs.mkShell {
-            packages = [
-              python
-              trixWrapper
-              pkgs.ruff
+            packages = with pkgs; [
+              cargo
+              clippy
+              rust-analyzer
+              rustc
+              rustfmt
             ];
 
             shellHook = ''
-              export PYTHONPATH=$PWD/src
-
-              echo 'trix --help'
-              trix --help
+              export PATH=$PWD/target/debug:$PATH
+              export RUST_SRC_PATH="${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
             '';
           };
         }
