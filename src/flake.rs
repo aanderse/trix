@@ -197,7 +197,7 @@ pub fn get_flake_inputs(flake_dir: &Path) -> Result<serde_json::Value> {
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", &expr, "--json", "--strict"]);
+    cmd.args(["--eval", "--json", "--strict", "--expr", &expr]);
 
     let raw_inputs: Vec<serde_json::Value> = match cmd.json() {
         Ok(inputs) => inputs,
@@ -360,7 +360,7 @@ pub fn get_nix_config(flake_dir: &Path, warn_unsupported: bool) -> serde_json::V
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", &expr, "--json", "--strict"]);
+    cmd.args(["--eval", "--json", "--strict", "--expr", &expr]);
 
     match cmd.json::<serde_json::Value>() {
         Ok(config) => {

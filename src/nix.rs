@@ -778,11 +778,11 @@ pub fn eval_flake_output_category(
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
     cmd.args([
         "--eval",
-        "--expr",
-        &expr,
         "--json",
         "--strict",
         "--read-write-mode",
+        "--expr",
+        &expr,
     ]);
 
     match cmd.json() {
