@@ -105,6 +105,11 @@ let
     else
       throw "trix: unknown source type '${type}' for input '${name}'";
 
+  # Remove null values
+  coalesceAttrs =
+    attrs:
+    builtins.removeAttrs attrs (builtins.filter (n: attrs.${n} == null) (builtins.attrNames attrs));
+
   # Build an input value from a fetched source
   # basePath is used for resolving relative path inputs in this node
   buildInput =
@@ -112,10 +117,16 @@ let
     let
       src = fetchSource name node basePath;
       isFlake = node.flake or true;
+
+      locked = (node.locked or { }) // {
+        shortRev = if locked ? rev then builtins.substring 0 7 locked.rev else null;
+      };
+
+      extraAttrs = coalesceAttrs locked;
     in
-    # Non-flake inputs just return the source path
+    # Non-flake inputs just return the source path and locked attrs
     if !isFlake then
-      { outPath = src; }
+      { outPath = src; } // extraAttrs
     # For flake inputs, import their flake.nix and call outputs
     else
       let
@@ -187,11 +198,13 @@ let
           outPath = src;
           inputs = inputInputs;
           _type = "flake";
-        };
+        }
+        // extraAttrs;
         # Use recursive self-reference so flake can reference its own outputs
         inputOutputs = inputFlake.outputs (inputInputs // { self = inputSelf // inputOutputs; });
       in
       inputOutputs
+      // extraAttrs
       // {
         outPath = src;
         inputs = inputInputs;
