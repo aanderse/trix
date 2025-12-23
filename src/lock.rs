@@ -86,7 +86,6 @@ fn format_locked_url(node: &LockNode) -> String {
     }
 }
 
-
 /// Lock file structure (version 7)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LockFile {
@@ -773,10 +772,17 @@ fn print_lock_changes(
 ///
 /// Uses nix flake prefetch which respects access-tokens for private repos.
 /// Produces native flake.lock format (version 7).
-pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
+/// Sync flake.nix inputs to lock file.
+///
+/// Uses nix flake prefetch which respects access-tokens for private repos.
+/// Produces native flake.lock format (version 7).
+pub fn sync_inputs(flake_dir: &Path, inputs: Option<serde_json::Value>) -> Result<bool> {
     let flake_lock = flake_dir.join("flake.lock");
     let lock_existed = flake_lock.exists();
-    let inputs = get_flake_inputs(flake_dir)?;
+    let inputs = match inputs {
+        Some(i) => i,
+        None => get_flake_inputs(flake_dir)?,
+    };
 
     let input_map = match inputs.as_object() {
         Some(m) if !m.is_empty() => m,
@@ -928,8 +934,8 @@ pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
 }
 
 /// Ensure lock file exists and is up to date with flake inputs.
-pub fn ensure_lock(flake_dir: &Path) -> Result<()> {
-    sync_inputs(flake_dir)?;
+pub fn ensure_lock(flake_dir: &Path, inputs: Option<serde_json::Value>) -> Result<()> {
+    sync_inputs(flake_dir, inputs)?;
     Ok(())
 }
 

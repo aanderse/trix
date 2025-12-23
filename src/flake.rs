@@ -548,11 +548,14 @@ pub fn resolve_attr_path(attr_part: &str, default_category: &str, system: &str) 
 }
 
 /// Ensure flake.lock exists with locked versions of flake inputs.
-pub fn ensure_lock(flake_dir: &Path) -> Result<()> {
+pub fn ensure_lock(flake_dir: &Path, inputs: Option<serde_json::Value>) -> Result<()> {
     use crate::lock::ensure_lock as lock_inputs;
 
-    // Get input names from flake.nix
-    let inputs = get_flake_inputs(flake_dir)?;
+    // Get input names from flake.nix if not provided
+    let inputs = match inputs {
+        Some(i) => i,
+        None => get_flake_inputs(flake_dir)?,
+    };
 
     if inputs.as_object().map(|m| m.is_empty()).unwrap_or(true) {
         // No inputs at all - skip entirely
@@ -564,7 +567,7 @@ pub fn ensure_lock(flake_dir: &Path) -> Result<()> {
         tracing::warn!("No flake.lock found. Locking flake inputs...");
     }
 
-    lock_inputs(flake_dir)
+    lock_inputs(flake_dir, Some(inputs))
 }
 
 #[cfg(test)]
