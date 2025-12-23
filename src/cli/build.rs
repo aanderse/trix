@@ -23,7 +23,7 @@ fn build_resolved_attribute(
     let flake_dir = resolved.flake_dir.as_ref().context("No flake directory")?;
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     run_nix_build(flake_dir, attr, options, capture_output)
 }
@@ -122,7 +122,7 @@ pub fn cmd_develop(
     let system = get_system()?;
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     // Resolve attribute path for devShells
     let attr = resolve_attr_path(&resolved.attr_part, "devShells", &system);
@@ -181,7 +181,7 @@ pub fn cmd_run(
     let system = get_system()?;
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     // Try apps first, then packages
     // Empty attr_part (from ".#") defaults to "default"
@@ -258,7 +258,7 @@ pub fn cmd_copy(installable: &str, to: &str, no_check_sigs: bool) -> Result<()> 
     let system = get_system()?;
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     // Get attribute
     let attr = resolve_attr_path(&resolved.attr_part, "packages", &system);

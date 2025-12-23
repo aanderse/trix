@@ -80,7 +80,7 @@ pub fn cmd_eval(opts: EvalCommandOptions) -> Result<()> {
     let flake_dir = resolved.flake_dir.as_ref().context("No flake directory")?;
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     let options = EvalOptions {
         output_json,
@@ -130,7 +130,7 @@ pub fn cmd_repl(flake_ref: Option<&str>) -> Result<()> {
     }
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     run_nix_repl(flake_dir)
 }

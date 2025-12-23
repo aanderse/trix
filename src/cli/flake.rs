@@ -33,7 +33,7 @@ pub fn cmd_show(flake_ref: Option<&str>, all_systems: bool, legacy: bool) -> Res
     let flake_dir = resolved.flake_dir.as_ref().context("No flake directory")?;
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     // Print flake URL header (bold, like nix)
     let canonical_path = flake_dir
@@ -482,7 +482,7 @@ pub fn cmd_lock(flake_ref: Option<&str>) -> Result<()> {
 
     let flake_dir = resolved.flake_dir.as_ref().context("No flake directory")?;
 
-    sync_inputs(flake_dir)?;
+    sync_inputs(flake_dir, None)?;
     println!("Wrote flake.lock");
 
     Ok(())
@@ -507,7 +507,7 @@ pub fn cmd_check(flake_ref: Option<&str>, all_systems: bool) -> Result<()> {
     let system = get_system()?;
 
     // Ensure lock exists
-    ensure_lock(flake_dir)?;
+    ensure_lock(flake_dir, None)?;
 
     // Get checks for current system
     let checks_attr = format!("checks.{}", system);
