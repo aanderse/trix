@@ -254,6 +254,9 @@ enum FlakeCommands {
     Update {
         /// Specific input to update
         input_name: Option<String>,
+        /// Override a specific input to a flake reference (can be repeated)
+        #[arg(long = "override-input", value_names = ["INPUT", "FLAKE_REF"], num_args = 2, action = clap::ArgAction::Append)]
+        override_input: Vec<String>,
     },
 
     /// Create or update flake.lock without building
@@ -523,7 +526,27 @@ fn run(cli: Cli) -> Result<()> {
 
             FlakeCommands::Metadata { flake_ref } => cli::flake::cmd_metadata(flake_ref.as_deref()),
 
-            FlakeCommands::Update { input_name } => cli::flake::cmd_update(input_name.as_deref()),
+            FlakeCommands::Update {
+                input_name,
+                override_input,
+            } => {
+                let override_inputs: std::collections::HashMap<String, String> = override_input
+                    .chunks(2)
+                    .filter_map(|chunk| {
+                        if chunk.len() == 2 {
+                            Some((chunk[0].clone(), chunk[1].clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let override_ref = if override_inputs.is_empty() {
+                    None
+                } else {
+                    Some(&override_inputs)
+                };
+                cli::flake::cmd_update(input_name.as_deref(), override_ref)
+            }
 
             FlakeCommands::Lock { flake_ref } => cli::flake::cmd_lock(flake_ref.as_deref()),
 

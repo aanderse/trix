@@ -3,13 +3,89 @@
 //! Produces flake.lock files in the native nix format (version 7).
 
 use anyhow::Result;
+use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::collections::HashMap;
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::flake::get_flake_inputs;
+
+// ============================================================================
+// ANSI color helpers (matching nix's style)
+// ============================================================================
+
+fn use_color() -> bool {
+    std::io::stderr().is_terminal()
+}
+
+fn yellow(text: &str) -> String {
+    if use_color() {
+        format!("\x1b[1;33m{}\x1b[0m", text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn magenta(text: &str) -> String {
+    if use_color() {
+        format!("\x1b[1;35m{}\x1b[0m", text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn cyan(text: &str) -> String {
+    if use_color() {
+        format!("\x1b[36m{}\x1b[0m", text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn bold(text: &str) -> String {
+    if use_color() {
+        format!("\x1b[1m{}\x1b[0m", text)
+    } else {
+        text.to_string()
+    }
+}
+
+/// Format a locked node as a display URL with date (matching nix's format).
+fn format_locked_url(node: &LockNode) -> String {
+    if let Some(ref locked) = node.locked {
+        let url = match locked.lock_type.as_str() {
+            "github" => {
+                let owner = locked.owner.as_deref().unwrap_or("");
+                let repo = locked.repo.as_deref().unwrap_or("");
+                let rev = locked.rev.as_deref().unwrap_or("");
+                format!("github:{}/{}/{}", owner, repo, rev)
+            }
+            "git" => {
+                let url = locked.url.as_deref().unwrap_or("");
+                let rev = locked.rev.as_deref().unwrap_or("");
+                format!("git+{}?rev={}", url, rev)
+            }
+            "path" => {
+                format!("path:{}", locked.path.as_deref().unwrap_or(""))
+            }
+            _ => format!("{:?}", locked),
+        };
+
+        if let Some(last_modified) = locked.last_modified {
+            if let Some(dt) = DateTime::from_timestamp(last_modified, 0) {
+                let local_dt = dt.with_timezone(&Local);
+                return format!("{} ({})", url, local_dt.format("%Y-%m-%d"));
+            }
+        }
+        url
+    } else {
+        String::new()
+    }
+}
+
 
 /// Lock file structure (version 7)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -54,6 +130,8 @@ pub struct LockedInfo {
     pub nar_hash: Option<String>,
     #[serde(rename = "lastModified", skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<i64>,
+    #[serde(rename = "revCount", skip_serializing_if = "Option::is_none")]
+    pub rev_count: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
 }
@@ -206,6 +284,7 @@ fn lock_input(name: &str, spec: &Value) -> Result<Option<LockNode>> {
                 locked.nar_hash =
                     get_field(&result, "hash").or_else(|| get_field(&result, "narHash"));
                 locked.last_modified = get_int_field(&result, "lastModified");
+                locked.rev_count = get_int_field(&result, "revCount");
             }
             _ => {
                 // Generic handling for other types
@@ -275,6 +354,279 @@ fn lock_input(name: &str, spec: &Value) -> Result<Option<LockNode>> {
     }
 }
 
+/// Fetch a locked input's source and read its flake.lock.
+///
+/// Returns the parsed flake.lock content, or None if no flake.lock exists.
+fn fetch_source_flake_lock(node: &LockNode, input_name: &str) -> Option<Value> {
+    let locked = node.locked.as_ref()?;
+    let source_type = &locked.lock_type;
+
+    // Path inputs: read directly from filesystem
+    if source_type == "path" {
+        let path = locked.path.as_ref()?;
+        let lock_path = Path::new(path).join("flake.lock");
+        if !lock_path.exists() {
+            return None;
+        }
+        return fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok());
+    }
+
+    // Build nix expression to fetch and read flake.lock
+    let nix_expr = match source_type.as_str() {
+        "git" => {
+            let url = locked.url.as_deref().unwrap_or("");
+            let rev = locked.rev.as_deref().unwrap_or("");
+            let nar_hash = locked.nar_hash.as_deref().unwrap_or("");
+            let ref_part = locked
+                .git_ref
+                .as_ref()
+                .map(|r| format!("ref = \"{}\";", r))
+                .unwrap_or_default();
+            format!(
+                r#"
+                let
+                  src = builtins.fetchGit {{
+                    url = "{}";
+                    rev = "{}";
+                    narHash = "{}";
+                    {}
+                  }};
+                  lockPath = src + "/flake.lock";
+                in
+                  if builtins.pathExists lockPath
+                  then builtins.readFile lockPath
+                  else ""
+                "#,
+                url, rev, nar_hash, ref_part
+            )
+        }
+        "github" => {
+            let owner = locked.owner.as_deref().unwrap_or("");
+            let repo = locked.repo.as_deref().unwrap_or("");
+            let rev = locked.rev.as_deref().unwrap_or("");
+            let nar_hash = locked.nar_hash.as_deref().unwrap_or("");
+            let url = format!(
+                "https://github.com/{}/{}/archive/{}.tar.gz",
+                owner, repo, rev
+            );
+            format!(
+                r#"
+                let
+                  src = builtins.fetchTarball {{
+                    url = "{}";
+                    sha256 = "{}";
+                  }};
+                  lockPath = src + "/flake.lock";
+                in
+                  if builtins.pathExists lockPath
+                  then builtins.readFile lockPath
+                  else ""
+                "#,
+                url, nar_hash
+            )
+        }
+        "gitlab" => {
+            let owner = locked.owner.as_deref().unwrap_or("");
+            let repo = locked.repo.as_deref().unwrap_or("");
+            let rev = locked.rev.as_deref().unwrap_or("");
+            let nar_hash = locked.nar_hash.as_deref().unwrap_or("");
+            let host = locked.host.as_deref().unwrap_or("gitlab.com");
+            let url = format!(
+                "https://{}/{}/{}/-/archive/{}/{}-{}.tar.gz",
+                host, owner, repo, rev, repo, rev
+            );
+            format!(
+                r#"
+                let
+                  src = builtins.fetchTarball {{
+                    url = "{}";
+                    sha256 = "{}";
+                  }};
+                  lockPath = src + "/flake.lock";
+                in
+                  if builtins.pathExists lockPath
+                  then builtins.readFile lockPath
+                  else ""
+                "#,
+                url, nar_hash
+            )
+        }
+        "sourcehut" => {
+            let owner = locked.owner.as_deref().unwrap_or("");
+            let repo = locked.repo.as_deref().unwrap_or("");
+            let rev = locked.rev.as_deref().unwrap_or("");
+            let nar_hash = locked.nar_hash.as_deref().unwrap_or("");
+            let host = locked.host.as_deref().unwrap_or("git.sr.ht");
+            let url = format!(
+                "https://{}/~{}/{}/archive/{}.tar.gz",
+                host, owner, repo, rev
+            );
+            format!(
+                r#"
+                let
+                  src = builtins.fetchTarball {{
+                    url = "{}";
+                    sha256 = "{}";
+                  }};
+                  lockPath = src + "/flake.lock";
+                in
+                  if builtins.pathExists lockPath
+                  then builtins.readFile lockPath
+                  else ""
+                "#,
+                url, nar_hash
+            )
+        }
+        "mercurial" | "hg" => {
+            crate::nix::warn(&format!(
+                "mercurial input '{}' skipped (not supported for transitive dependency collection)",
+                input_name
+            ));
+            return None;
+        }
+        _ => {
+            crate::nix::warn(&format!(
+                "unknown source type '{}' for input '{}', skipping transitive dependency collection",
+                source_type, input_name
+            ));
+            return None;
+        }
+    };
+
+    // Run nix-instantiate to fetch and read the lock file
+    let output = std::process::Command::new("nix-instantiate")
+        .args(["--eval", "--expr", &nix_expr])
+        .env_remove("TMPDIR")
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let result = String::from_utf8_lossy(&output.stdout);
+    let result = result.trim();
+
+    // nix-instantiate returns a quoted string
+    if result.starts_with('"') && result.ends_with('"') {
+        let unquoted = &result[1..result.len() - 1];
+        // Unescape the string
+        let unescaped = unquoted
+            .replace("\\n", "\n")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+
+        if unescaped.is_empty() {
+            return None;
+        }
+
+        serde_json::from_str(&unescaped).ok()
+    } else {
+        None
+    }
+}
+
+/// Recursively collect transitive dependencies from an input's flake.lock.
+///
+/// For flake inputs, fetches their source and reads their flake.lock to find
+/// transitive dependencies that need to be added to our lock file.
+fn collect_transitive_deps(
+    node: &mut LockNode,
+    node_name: &str,
+    new_nodes: &mut HashMap<String, LockNode>,
+    added_inputs: &mut Vec<(String, LockNode)>,
+) {
+    // Skip non-flake inputs
+    if node.flake == Some(false) {
+        return;
+    }
+
+    // Get the input's flake.lock
+    let input_lock = match fetch_source_flake_lock(node, node_name) {
+        Some(lock) => lock,
+        None => return,
+    };
+
+    let input_nodes = match input_lock.get("nodes").and_then(|n| n.as_object()) {
+        Some(nodes) => nodes,
+        None => return,
+    };
+
+    let input_root_inputs = match input_nodes
+        .get("root")
+        .and_then(|r| r.get("inputs"))
+        .and_then(|i| i.as_object())
+    {
+        Some(inputs) => inputs,
+        None => return,
+    };
+
+    // Get existing overrides from this node
+    let node_inputs = node.inputs.clone().unwrap_or_default();
+
+    // For each input in the transitive flake.lock
+    for (input_name, ref_value) in input_root_inputs {
+        // Resolve the reference to a node name
+        let ref_node_name = if let Some(arr) = ref_value.as_array() {
+            // Follows reference within the input's lock
+            arr.first()
+                .and_then(|v| v.as_str())
+                .unwrap_or(input_name)
+                .to_string()
+        } else {
+            ref_value.as_str().unwrap_or(input_name).to_string()
+        };
+
+        // Skip if already overridden by a follows in our lock (list values)
+        if let Some(existing_ref) = node_inputs.get(input_name) {
+            if existing_ref.is_array() {
+                continue;
+            }
+        }
+
+        // Add the input reference to this node (if not already there)
+        if node.inputs.is_none() {
+            node.inputs = Some(HashMap::new());
+        }
+        if let Some(ref mut inputs) = node.inputs {
+            if !inputs.contains_key(input_name) {
+                inputs.insert(input_name.clone(), json!(ref_node_name));
+            }
+        }
+
+        // Skip adding the node if we already have it
+        if new_nodes.contains_key(&ref_node_name) {
+            continue;
+        }
+
+        // Get the transitive node from the input's lock
+        let trans_node_value = match input_nodes.get(&ref_node_name) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Parse as LockNode
+        let mut trans_node: LockNode = match serde_json::from_value(trans_node_value.clone()) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        tracing::debug!("  Adding transitive dep '{}'", ref_node_name);
+
+        // Add to our lock
+        new_nodes.insert(ref_node_name.clone(), trans_node.clone());
+        added_inputs.push((ref_node_name.clone(), trans_node.clone()));
+
+        // Recursively collect this node's transitive deps
+        collect_transitive_deps(&mut trans_node, &ref_node_name, new_nodes, added_inputs);
+
+        // Update the node in new_nodes with any changes from recursion
+        new_nodes.insert(ref_node_name, trans_node);
+    }
+}
+
 /// Read existing lock file or return empty structure.
 fn read_lock(flake_lock: &Path) -> LockFile {
     let default_lock = || {
@@ -303,11 +655,118 @@ fn read_lock(flake_lock: &Path) -> LockFile {
     }
 }
 
-/// Write lock file with consistent formatting.
+/// Recursively remove null values from JSON (nix doesn't accept them).
+fn remove_nulls(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let filtered: Map<String, Value> = map
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .map(|(k, v)| (k, remove_nulls(v)))
+                .collect();
+            Value::Object(filtered)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(remove_nulls).collect()),
+        other => other,
+    }
+}
+
+/// Recursively sort all keys in a JSON value.
+fn sort_json(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted: Vec<_> = map.into_iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            let sorted_map: Map<String, Value> =
+                sorted.into_iter().map(|(k, v)| (k, sort_json(v))).collect();
+            Value::Object(sorted_map)
+        }
+        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_json).collect()),
+        other => other,
+    }
+}
+
+/// Write lock file with consistent formatting and sorted keys.
 fn write_lock(flake_lock: &Path, lock_data: &LockFile) -> Result<()> {
-    let content = serde_json::to_string_pretty(lock_data)?;
+    let value = serde_json::to_value(lock_data)?;
+    let sanitized = remove_nulls(value);
+    let sorted = sort_json(sanitized);
+    let content = serde_json::to_string_pretty(&sorted)?;
     fs::write(flake_lock, format!("{}\n", content))?;
     Ok(())
+}
+
+/// Print lock file changes in nix's format.
+fn print_lock_changes(
+    flake_lock: &Path,
+    lock_existed: bool,
+    added_inputs: &[(String, LockNode)],
+    updated_inputs: &[(String, LockNode, LockNode)],
+    removed_inputs: &[String],
+    added_follows: &[(String, Vec<String>)],
+) {
+    if added_inputs.is_empty()
+        && updated_inputs.is_empty()
+        && removed_inputs.is_empty()
+        && added_follows.is_empty()
+    {
+        return;
+    }
+
+    let action = if lock_existed { "updating" } else { "creating" };
+    eprintln!(
+        "{} {} lock file '{}':",
+        yellow("warning:"),
+        action,
+        flake_lock.display()
+    );
+
+    for (name, node) in added_inputs {
+        let url = format_locked_url(node);
+        eprintln!(
+            "{} {} {}:",
+            magenta("•"),
+            magenta("Added input"),
+            bold(&format!("'{}'", name))
+        );
+        eprintln!("    {}", cyan(&format!("'{}'", url)));
+    }
+
+    for (name, follows_path) in added_follows {
+        eprintln!(
+            "{} {} {}:",
+            magenta("•"),
+            magenta("Added input"),
+            bold(&format!("'{}'", name))
+        );
+        eprintln!(
+            "    {} {}",
+            magenta("follows"),
+            cyan(&format!("'{}'", follows_path.join("/")))
+        );
+    }
+
+    for (name, old_node, new_node) in updated_inputs {
+        let old_url = format_locked_url(old_node);
+        let new_url = format_locked_url(new_node);
+        eprintln!(
+            "{} {} {}:",
+            magenta("•"),
+            magenta("Updated input"),
+            bold(&format!("'{}'", name))
+        );
+        eprintln!("    {}", cyan(&format!("'{}'", old_url)));
+        eprintln!("  → {}", cyan(&format!("'{}'", new_url)));
+    }
+
+    for name in removed_inputs {
+        eprintln!(
+            "{} {} {}",
+            magenta("•"),
+            magenta("Removed input"),
+            bold(&format!("'{}'", name))
+        );
+    }
 }
 
 /// Sync flake.nix inputs to lock file.
@@ -316,6 +775,7 @@ fn write_lock(flake_lock: &Path, lock_data: &LockFile) -> Result<()> {
 /// Produces native flake.lock format (version 7).
 pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
     let flake_lock = flake_dir.join("flake.lock");
+    let lock_existed = flake_lock.exists();
     let inputs = get_flake_inputs(flake_dir)?;
 
     let input_map = match inputs.as_object() {
@@ -325,7 +785,11 @@ pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
 
     // Read existing lock
     let mut lock_data = read_lock(&flake_lock);
-    let mut changed = false;
+
+    // Track changes for output
+    let mut added_inputs: Vec<(String, LockNode)> = Vec::new();
+    let mut added_follows: Vec<(String, Vec<String>)> = Vec::new();
+    let mut removed_inputs: Vec<String> = Vec::new();
 
     // Ensure root node exists
     if !lock_data.nodes.contains_key("root") {
@@ -336,7 +800,6 @@ pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
                 ..Default::default()
             },
         );
-        changed = true;
     }
 
     // Ensure root has inputs map
@@ -347,7 +810,7 @@ pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
     }
 
     // Collect input names for tracking
-    let input_names: std::collections::HashSet<String> = input_map.keys().cloned().collect();
+    let input_names: HashSet<String> = input_map.keys().cloned().collect();
 
     // Collect existing root input keys for removal check (done after processing)
     let existing_root_keys: Vec<String> = lock_data
@@ -364,14 +827,17 @@ pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
         // Handle follows
         if input_type == "follows" {
             if let Some(follows) = spec["follows"].as_array() {
-                let follows_path: Vec<Value> = follows
+                let follows_path: Vec<String> = follows
                     .iter()
-                    .filter_map(|v| v.as_str().map(|s| json!(s)))
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
+                let follows_value: Vec<Value> =
+                    follows_path.iter().map(|s| json!(s)).collect();
+
                 if let Some(root) = lock_data.nodes.get_mut("root") {
                     if let Some(ref mut root_inputs) = root.inputs {
-                        root_inputs.insert(name.clone(), Value::Array(follows_path));
-                        changed = true;
+                        root_inputs.insert(name.clone(), Value::Array(follows_value));
+                        added_follows.push((name.clone(), follows_path));
                     }
                 }
             }
@@ -395,16 +861,35 @@ pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
         }
 
         // Lock the input
-        if let Some(node) = lock_input(name, spec)? {
-            lock_data.nodes.insert(name.clone(), node);
+        if let Some(mut node) = lock_input(name, spec)? {
+            // Add transitive follows if specified
+            if let Some(follows_map) = spec.get("follows").and_then(|f| f.as_object()) {
+                let mut node_inputs = node.inputs.clone().unwrap_or_default();
+                for (follow_name, follow_path) in follows_map {
+                    if let Some(arr) = follow_path.as_array() {
+                        let path: Vec<Value> = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| json!(s)))
+                            .collect();
+                        node_inputs.insert(follow_name.clone(), Value::Array(path));
+                    }
+                }
+                if !node_inputs.is_empty() {
+                    node.inputs = Some(node_inputs);
+                }
+            }
+
+            // Collect transitive dependencies
+            collect_transitive_deps(&mut node, name, &mut lock_data.nodes, &mut added_inputs);
+
+            lock_data.nodes.insert(name.clone(), node.clone());
             if let Some(root) = lock_data.nodes.get_mut("root") {
                 if let Some(ref mut root_inputs) = root.inputs {
                     root_inputs.insert(name.clone(), json!(name));
                 }
             }
-            changed = true;
 
-            tracing::info!("• locked input '{}'", name);
+            added_inputs.push((name.clone(), node));
         }
     }
 
@@ -414,21 +899,29 @@ pub fn sync_inputs(flake_dir: &Path) -> Result<bool> {
         .filter(|k| !input_names.contains(k))
         .collect();
 
-    for name in to_remove {
+    for name in &to_remove {
         if let Some(root) = lock_data.nodes.get_mut("root") {
             if let Some(ref mut root_inputs) = root.inputs {
-                root_inputs.remove(&name);
+                root_inputs.remove(name);
             }
         }
-        lock_data.nodes.remove(&name);
-        changed = true;
-
-        tracing::info!("• removed input '{}'", name);
+        lock_data.nodes.remove(name);
+        removed_inputs.push(name.clone());
     }
 
     // Write if changed
+    let changed =
+        !added_inputs.is_empty() || !added_follows.is_empty() || !removed_inputs.is_empty();
     if changed {
         write_lock(&flake_lock, &lock_data)?;
+        print_lock_changes(
+            &flake_lock,
+            lock_existed,
+            &added_inputs,
+            &[], // No updates in sync_inputs
+            &removed_inputs,
+            &added_follows,
+        );
     }
 
     Ok(true)
@@ -440,33 +933,263 @@ pub fn ensure_lock(flake_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Lock an input to a specific flake reference (for --override-input).
+fn lock_flake_ref(
+    name: &str,
+    flake_ref: &str,
+    original_spec: Option<&Value>,
+) -> Result<Option<LockNode>> {
+    tracing::debug!("Locking {} to {}", name, flake_ref);
+
+    let prefetch_result = prefetch_flake(flake_ref)?;
+    let result = match prefetch_result {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+
+    let locked = result.get("locked").cloned().unwrap_or_default();
+    let prefetch_original = result.get("original").cloned().unwrap_or_default();
+    let source_type = locked["type"].as_str().unwrap_or("");
+
+    let nar_hash = result["hash"]
+        .as_str()
+        .or_else(|| locked["narHash"].as_str())
+        .map(|s| s.to_string());
+
+    match source_type {
+        "github" => {
+            // Build original from flake.nix spec if provided (for overrides)
+            let original = if let Some(spec) = original_spec {
+                if spec["type"].as_str() == Some("github") {
+                    let mut orig = serde_json::Map::new();
+                    orig.insert("type".to_string(), json!("github"));
+                    if let Some(owner) = spec["owner"].as_str() {
+                        orig.insert("owner".to_string(), json!(owner));
+                    }
+                    if let Some(repo) = spec["repo"].as_str() {
+                        orig.insert("repo".to_string(), json!(repo));
+                    }
+                    if let Some(git_ref) = spec["ref"].as_str() {
+                        orig.insert("ref".to_string(), json!(git_ref));
+                    }
+                    Value::Object(orig)
+                } else {
+                    prefetch_original
+                }
+            } else {
+                prefetch_original
+            };
+
+            Ok(Some(LockNode {
+                locked: Some(LockedInfo {
+                    lock_type: "github".to_string(),
+                    owner: locked["owner"].as_str().map(|s| s.to_string()),
+                    repo: locked["repo"].as_str().map(|s| s.to_string()),
+                    rev: locked["rev"].as_str().map(|s| s.to_string()),
+                    nar_hash,
+                    last_modified: locked["lastModified"].as_i64(),
+                    ..Default::default()
+                }),
+                original: Some(original),
+                ..Default::default()
+            }))
+        }
+        "git" => {
+            let original = if let Some(spec) = original_spec {
+                if spec["type"].as_str() == Some("git") {
+                    let mut orig = serde_json::Map::new();
+                    orig.insert("type".to_string(), json!("git"));
+                    if let Some(url) = spec["url"].as_str() {
+                        orig.insert("url".to_string(), json!(url));
+                    }
+                    if let Some(git_ref) = spec["ref"].as_str() {
+                        orig.insert("ref".to_string(), json!(git_ref));
+                    }
+                    Value::Object(orig)
+                } else {
+                    prefetch_original
+                }
+            } else {
+                prefetch_original
+            };
+
+            Ok(Some(LockNode {
+                locked: Some(LockedInfo {
+                    lock_type: "git".to_string(),
+                    url: locked["url"].as_str().map(|s| s.to_string()),
+                    rev: locked["rev"].as_str().map(|s| s.to_string()),
+                    git_ref: locked["ref"].as_str().map(|s| s.to_string()),
+                    nar_hash,
+                    last_modified: locked["lastModified"].as_i64(),
+                    rev_count: locked["revCount"].as_i64(),
+                    ..Default::default()
+                }),
+                original: Some(original),
+                ..Default::default()
+            }))
+        }
+        _ => {
+            eprintln!("Unsupported flake type for override: {}", source_type);
+            Ok(None)
+        }
+    }
+}
+
 /// Update locked inputs to latest versions.
+///
+/// Args:
+///   flake_dir: Directory containing flake.nix
+///   input_name: Specific input to update, or None for all
+///   override_inputs: Dict mapping input names to flake refs to pin to
 pub fn update_lock(
     flake_dir: &Path,
     input_name: Option<&str>,
+    override_inputs: Option<&HashMap<String, String>>,
 ) -> Result<Option<HashMap<String, (Value, Value)>>> {
     let flake_lock = flake_dir.join("flake.lock");
+    let lock_existed = flake_lock.exists();
     let inputs = get_flake_inputs(flake_dir)?;
+    let override_inputs = override_inputs.cloned().unwrap_or_default();
 
     let input_map = match inputs.as_object() {
         Some(m) if !m.is_empty() => m,
         _ => return Ok(Some(HashMap::new())),
     };
 
-    // Read existing lock
-    let mut lock_data = read_lock(&flake_lock);
-    let mut updates = HashMap::new();
+    // Validate override inputs exist in flake.nix
+    for name in override_inputs.keys() {
+        if !input_map.contains_key(name) {
+            eprintln!("Error: input '{}' not found in flake.nix", name);
+            return Ok(None);
+        }
+    }
 
-    // Determine which inputs to update
-    let inputs_to_update: Vec<_> = if let Some(name) = input_name {
-        if input_map.contains_key(name) {
-            vec![name.to_string()]
+    // Read existing lock or create new
+    let mut lock_data = read_lock(&flake_lock);
+    let mut updates: HashMap<String, (Value, Value)> = HashMap::new();
+    let mut added_inputs: Vec<(String, LockNode)> = Vec::new();
+    let mut updated_inputs: Vec<(String, LockNode, LockNode)> = Vec::new();
+
+    // Ensure root node exists
+    if !lock_data.nodes.contains_key("root") {
+        lock_data.nodes.insert(
+            "root".to_string(),
+            LockNode {
+                inputs: Some(HashMap::new()),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Ensure root has inputs map
+    let root_inputs = lock_data
+        .nodes
+        .get_mut("root")
+        .and_then(|r| r.inputs.as_mut());
+
+    if root_inputs.is_none() {
+        if let Some(root) = lock_data.nodes.get_mut("root") {
+            root.inputs = Some(HashMap::new());
+        }
+    }
+
+    // Apply override inputs first
+    for (name, flake_ref) in &override_inputs {
+        let old_node = lock_data.nodes.get(name).cloned();
+        let original_spec = input_map.get(name);
+
+        if let Some(new_node) = lock_flake_ref(name, flake_ref, original_spec)? {
+            let old_rev = old_node
+                .as_ref()
+                .and_then(|n| n.locked.as_ref())
+                .and_then(|l| l.rev.as_ref())
+                .map(|r| &r[..11.min(r.len())])
+                .unwrap_or("");
+            let new_rev = new_node
+                .locked
+                .as_ref()
+                .and_then(|l| l.rev.as_ref())
+                .map(|r| &r[..11.min(r.len())])
+                .unwrap_or("");
+
+            if old_rev != new_rev {
+                if let Some(ref old) = old_node {
+                    let old_val = serde_json::to_value(&old.locked).unwrap_or_default();
+                    let new_val = serde_json::to_value(&new_node.locked).unwrap_or_default();
+                    updates.insert(name.clone(), (old_val, new_val));
+                    updated_inputs.push((name.clone(), old.clone(), new_node.clone()));
+                } else {
+                    added_inputs.push((name.clone(), new_node.clone()));
+                }
+            }
+
+            // Collect transitive dependencies
+            let mut node = new_node.clone();
+            collect_transitive_deps(&mut node, name, &mut lock_data.nodes, &mut added_inputs);
+
+            lock_data.nodes.insert(name.clone(), node);
+            if let Some(root) = lock_data.nodes.get_mut("root") {
+                if let Some(ref mut inputs) = root.inputs {
+                    inputs.insert(name.clone(), json!(name));
+                }
+            }
         } else {
-            eprintln!("warning: input '{}' not found in flake.nix", name);
+            eprintln!("Error: Failed to lock '{}' to {}", name, flake_ref);
+            return Ok(None);
+        }
+    }
+
+    // If we only have overrides and no input_name, we're done
+    if !override_inputs.is_empty() && input_name.is_none() {
+        write_lock(&flake_lock, &lock_data)?;
+        print_lock_changes(
+            &flake_lock,
+            lock_existed,
+            &added_inputs,
+            &updated_inputs,
+            &[],
+            &[],
+        );
+
+        // Inform user if nothing changed
+        if updates.is_empty() && added_inputs.is_empty() {
+            for name in override_inputs.keys() {
+                let rev = lock_data
+                    .nodes
+                    .get(name)
+                    .and_then(|n| n.locked.as_ref())
+                    .and_then(|l| l.rev.as_ref())
+                    .map(|r| &r[..11.min(r.len())])
+                    .unwrap_or("");
+                eprintln!(
+                    "{} input {} already at {}",
+                    yellow("warning:"),
+                    bold(&format!("'{}'", name)),
+                    cyan(rev)
+                );
+            }
+        }
+        return Ok(Some(updates));
+    }
+
+    // Determine which inputs to update (excluding already-overridden ones)
+    let inputs_to_update: Vec<String> = if let Some(name) = input_name {
+        if input_map.contains_key(name) {
+            if override_inputs.contains_key(name) {
+                vec![] // Already handled
+            } else {
+                vec![name.to_string()]
+            }
+        } else {
+            eprintln!("Error: input '{}' not found in flake.nix", name);
             return Ok(None);
         }
     } else {
-        input_map.keys().cloned().collect()
+        input_map
+            .keys()
+            .filter(|k| !override_inputs.contains_key(*k))
+            .cloned()
+            .collect()
     };
 
     for name in inputs_to_update {
@@ -482,43 +1205,76 @@ pub fn update_lock(
             continue;
         }
 
-        // Get old locked info
-        let old_locked = lock_data
-            .nodes
-            .get(&name)
-            .and_then(|n| n.locked.as_ref())
-            .map(|l| serde_json::to_value(l).unwrap_or_default());
+        let old_node = lock_data.nodes.get(&name).cloned();
 
         // Re-lock the input
-        if let Some(new_node) = lock_input(&name, spec)? {
-            let new_locked = new_node
+        if let Some(mut new_node) = lock_input(&name, spec)? {
+            let old_rev = old_node
+                .as_ref()
+                .and_then(|n| n.locked.as_ref())
+                .and_then(|l| l.rev.as_ref())
+                .map(|r| &r[..11.min(r.len())])
+                .unwrap_or("");
+            let new_rev = new_node
                 .locked
                 .as_ref()
-                .map(|l| serde_json::to_value(l).unwrap_or_default());
+                .and_then(|l| l.rev.as_ref())
+                .map(|r| &r[..11.min(r.len())])
+                .unwrap_or("");
 
-            // Check if changed
-            if old_locked != new_locked {
-                if let (Some(old), Some(new)) = (old_locked, new_locked) {
-                    updates.insert(name.clone(), (old, new));
+            if old_rev != new_rev {
+                if let Some(ref old) = old_node {
+                    let old_val = serde_json::to_value(&old.locked).unwrap_or_default();
+                    let new_val = serde_json::to_value(&new_node.locked).unwrap_or_default();
+                    updates.insert(name.clone(), (old_val, new_val));
+                    updated_inputs.push((name.clone(), old.clone(), new_node.clone()));
+                } else {
+                    added_inputs.push((name.clone(), new_node.clone()));
                 }
+            }
 
-                lock_data.nodes.insert(name.clone(), new_node);
-
-                // Ensure root inputs reference
-                if let Some(root) = lock_data.nodes.get_mut("root") {
-                    if let Some(ref mut inputs) = root.inputs {
-                        inputs.insert(name.clone(), json!(name));
+            // Add transitive follows if specified
+            if let Some(follows_map) = spec.get("follows").and_then(|f| f.as_object()) {
+                let mut node_inputs = new_node.inputs.clone().unwrap_or_default();
+                for (follow_name, follow_path) in follows_map {
+                    if let Some(arr) = follow_path.as_array() {
+                        let path: Vec<Value> = arr
+                            .iter()
+                            .filter_map(|v| v.as_str().map(|s| json!(s)))
+                            .collect();
+                        node_inputs.insert(follow_name.clone(), Value::Array(path));
                     }
                 }
+                if !node_inputs.is_empty() {
+                    new_node.inputs = Some(node_inputs);
+                }
+            }
 
-                tracing::info!("• updated input '{}'", name);
+            // Collect transitive dependencies
+            collect_transitive_deps(&mut new_node, &name, &mut lock_data.nodes, &mut added_inputs);
+
+            lock_data.nodes.insert(name.clone(), new_node);
+
+            // Ensure root inputs reference
+            if let Some(root) = lock_data.nodes.get_mut("root") {
+                if let Some(ref mut inputs) = root.inputs {
+                    inputs.insert(name.clone(), json!(name));
+                }
             }
         }
     }
 
     // Write if changed
-    if !updates.is_empty() {
+    if !updates.is_empty() || !added_inputs.is_empty() {
         write_lock(&flake_lock, &lock_data)?;
+        print_lock_changes(
+            &flake_lock,
+            lock_existed,
+            &added_inputs,
+            &updated_inputs,
+            &[],
+            &[],
+        );
     }
 
     Ok(Some(updates))
