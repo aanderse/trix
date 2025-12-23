@@ -7,6 +7,7 @@
   lock, # Parsed flake.lock content
   flakeDirPath, # Path to the flake directory
   system, # Current system
+  selfInfo ? { }, # Git info for self (rev, dirty, etc)
 }:
 
 let
@@ -242,7 +243,7 @@ let
     outPath = flakeDirPath;
     inputs = lockedInputs;
     _type = "flake";
-  };
+  } // selfInfo;
 
 in
 { inherit self; } // lockedInputs

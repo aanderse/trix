@@ -8,6 +8,7 @@
   flakeDir, # Path to directory containing flake.nix (as string or path)
   system, # Current system, e.g., "x86_64-linux"
   attr, # Attribute path to select, e.g., "packages.x86_64-linux.default"
+  selfInfo ? {}, # Git metadata for self input
 }:
 
 let
@@ -41,7 +42,7 @@ let
   inputs =
     let
       baseInputs = import ./inputs.nix {
-        inherit lock flakeDirPath system;
+        inherit lock flakeDirPath system selfInfo;
       };
     in
     baseInputs

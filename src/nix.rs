@@ -102,6 +102,47 @@ pub fn get_lock_expr(flake_dir: &Path) -> String {
     }
 }
 
+/// Get the Nix expression for the 'self' input metadata.
+///
+/// Matches Nix's behavior:
+/// - Clean repo: rev, shortRev, lastModified, lastModifiedDate, revCount
+/// - Dirty repo: dirtyRev, dirtyShortRev, lastModified, lastModifiedDate
+pub fn get_self_info_expr(flake_dir: &Path) -> String {
+    let git_info = crate::git::get_git_info(flake_dir).unwrap_or_default();
+
+    // Construct selfInfo attrset
+    let mut parts = Vec::new();
+
+    // Clean repo attributes
+    if let Some(rev) = git_info.rev {
+        parts.push(format!("rev = \"{}\";", rev));
+    }
+    if let Some(short_rev) = git_info.short_rev {
+        parts.push(format!("shortRev = \"{}\";", short_rev));
+    }
+    if let Some(count) = git_info.rev_count {
+        parts.push(format!("revCount = {};", count));
+    }
+
+    // Dirty repo attributes
+    if let Some(dirty_rev) = git_info.dirty_rev {
+        parts.push(format!("dirtyRev = \"{}\";", dirty_rev));
+    }
+    if let Some(dirty_short_rev) = git_info.dirty_short_rev {
+        parts.push(format!("dirtyShortRev = \"{}\";", dirty_short_rev));
+    }
+
+    // Always included attributes
+    if let Some(last_modified) = git_info.last_modified {
+        parts.push(format!("lastModified = {};", last_modified));
+    }
+    if let Some(date) = git_info.last_modified_date {
+        parts.push(format!("lastModifiedDate = \"{}\";", date));
+    }
+
+    format!("{{ {} }}", parts.join(" "))
+}
+
 /// Convert a dotted attribute path to a Nix list expression.
 ///
 /// Examples:
@@ -124,6 +165,7 @@ pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
     let nix_dir = get_nix_dir()?;
     let system = get_system()?;
     let lock_expr = get_lock_expr(flake_dir);
+    let self_info_expr = get_self_info_expr(flake_dir);
 
     Ok(format!(
         r#"
@@ -133,6 +175,7 @@ pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
       inputs = import {nix_dir}/inputs.nix {{
         inherit lock system;
         flakeDirPath = {flake_dir};
+        selfInfo = {self_info_expr};
       }};
       outputs = flake.outputs (inputs // {{ self = inputs.self // outputs; }});
 
@@ -156,6 +199,7 @@ pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
         flake_dir = flake_dir.display(),
         lock_expr = lock_expr,
         nix_dir = nix_dir.display(),
+        self_info_expr = self_info_expr,
     ))
 }
 
@@ -240,10 +284,12 @@ pub fn run_nix_build(
 ) -> Result<Option<String>> {
     let nix_dir = get_nix_dir()?;
     let system = get_system()?;
+    let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-build");
     cmd.arg(nix_dir.join("eval.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+    cmd.args(["--arg", "selfInfo", &self_info_expr]);
     cmd.args(["--argstr", "system", &system]);
     cmd.args(["--argstr", "attr", attr]);
 
@@ -292,10 +338,13 @@ pub struct ShellOptions {
 pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Result<()> {
     let nix_dir = get_nix_dir()?;
     let system = get_system()?;
+    let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-shell");
     cmd.arg(nix_dir.join("eval.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+    cmd.args(["--arg", "selfInfo", &self_info_expr]);
+
     cmd.args(["--argstr", "system", &system]);
     cmd.args(["--argstr", "attr", attr]);
 
@@ -562,11 +611,13 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
 pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
     let nix_dir = get_nix_dir()?;
     let system = get_system()?;
+    let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix");
     cmd.args(["repl", "--file"]);
     cmd.arg(nix_dir.join("repl.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+    cmd.args(["--arg", "selfInfo", &self_info_expr]);
     cmd.args(["--argstr", "system", &system]);
 
     cmd.exec()
@@ -576,10 +627,12 @@ pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
 pub fn get_derivation_path(flake_dir: &Path, attr: &str) -> Result<String> {
     let nix_dir = get_nix_dir()?;
     let system = get_system()?;
+    let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
     cmd.arg(nix_dir.join("eval.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+    cmd.args(["--arg", "selfInfo", &self_info_expr]);
     cmd.args(["--argstr", "system", &system]);
     cmd.args(["--argstr", "attr", attr]);
 

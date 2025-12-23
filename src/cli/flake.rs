@@ -647,6 +647,7 @@ fn run_template_copy(target_dir: &std::path::Path, template_ref: &str, is_new: b
         inherit lock;
         flakeDirPath = {};
         system = "{}";
+        selfInfo = {{}};
       }};
       outputs = flake.outputs (inputs // {{ self = inputs.self // outputs; }});
       template = {};

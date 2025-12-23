@@ -10,6 +10,7 @@ use clap_complete::{generate, Shell};
 mod cli;
 mod command;
 mod flake;
+mod git;
 mod lock;
 mod nix;
 mod profile;
