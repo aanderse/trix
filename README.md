@@ -3,7 +3,7 @@
 > `trix` - trick yourself into flakes
 
 `trix` is an alternative userland implementation of Nix flakes. It reads
-`flake.nix` and `flake.lock` files, resolves inputs, and evaluates outputs—all
+`flake.nix` and `flake.lock` files, resolves inputs, and evaluates outputs — all
 without requiring you to enable the experimental `flakes` or `nix-command`
 features. Under the hood, `trix` delegates to the stable "legacy" Nix commands
 (`nix-build`, `nix-shell`, `nix-instantiate`), giving you a modern flake
@@ -15,36 +15,38 @@ workflow built on proven foundations.
 > point, this doesn't mean we are stuck with the current implementation of
 > Flakes.
 
-`trix` acknowledges that the Flake _format_ is the future of Nix packaging, but
-provides an alternative _implementation_ that relies on the proven stability of
-traditional Nix tools.
+The primary motivation for `trix` is to address the stagnation of these
+"experimental" features. Despite being broadly adopted, `flakes` and
+`nix-command` have remained in experimental status for a significant time. This
+uncertainty creates a barrier to adoption (where using "experimental" features
+is often seen as a liability) and maintains ambiguity regarding their future.
+`trix` tries to bridges this gap, treating the Flake **format** as the standard
+while relying on the proven stability of traditional Nix internals.
 
-The primary motivation for `trix` is efficiency: `trix` will never inadvertently
-copy your local flakes to the Nix store. It evaluates flakes in-place,
-referencing your working directory directly, which keeps commands fast even in
-large repositories.
+`trix` allows using Nix as if the experimental feature flags `nix-command` and
+`flakes` were enabled, without modifying your global configuration. It works by
+delegating to stable "legacy" Nix commands (`nix-build`, `nix-shell`,
+`nix-instantiate`) whenever possible, rewriting each command to optionally
+inject `--extra-experimental-features "flakes nix-command"` when necessary.
 
-Additionally, `trix` lets you use flakes without enabling experimental features:
+This approach offers these benefits:
 
-- **`nix-command`**: `trix` provides a modern CLI experience (`trix build`,
-  `trix develop`, `trix run`) but delegates to stable legacy tools under the
-  hood.
-- **`flakes`**: `trix` implements its own flake resolver and evaluator, so you
-  can use `flake.nix` and `flake.lock` with any Nix installation.
-
-With `trix`, you can keep your `nix.conf` clean of
-`experimental-features = nix-command flakes`.
+- **No Global Configuration**: You can keep your `nix.conf` clean of
+  `experimental-features = nix-command flakes`.
+- **Efficiency**: `trix` evaluates flakes in-place without copying them to the
+  Nix store, referencing your working directory directly.
+- **Stability**: It leverages the battle-tested legacy Nix tools under the hood.
 
 ## Comparison
 
 ### vs `nix flake`
 
-| Feature           |         `nix flake`          |                    `trix`                    |
-| :---------------- | :--------------------------: | :------------------------------------------: |
-| **Stability**     |         Experimental         |     **Stable** (uses `nix-build`, etc.)      |
-| **Purity**        |           Enforced           |     Optional (allows impure evaluation)      |
+| Feature           |         `nix flake`          |                      `trix`                       |
+| :---------------- | :--------------------------: | :-----------------------------------------------: |
+| **Stability**     |         Experimental         |        **Stable** (uses `nix-build`, etc.)        |
+| **Purity**        |           Enforced           |        Optional (allows impure evaluation)        |
 | **Performance**   | Copies entire flake to store | **Efficient** (evaluates in-place, no store copy) |
-| **Specification** |             Full             |               Practical subset               |
+| **Specification** |             Full             |                 Practical subset                  |
 
 ### vs plain `nix-build` / `nix-shell`
 
@@ -73,18 +75,15 @@ experience using stable Nix commands. It operates as follows:
 5. **Execution**: Delegates the final build or shell action to `nix-build` or
    `nix-shell`.
 
-The resulting lock file is **fully compatible** with `nix flake` — you can
-switch between `trix` and official Flakes at any time.
+The resulting lock file is **fully compatible** with using `nix flake`
+experimental features. You can even switch between `trix` and official Flakes at
+any time without issues.
 
-### Examples
-
-- `trix develop [<path>#attr]`: Runs
-  `nix-shell <trix-path>/eval.nix --argstr attr devShells.<system>.<attr>`,
-  where `<system>` is the current system (e.g., `x86_64-linux`).
-- `trix build [<path>#attr]`: Runs
-  `nix-build <trix-path>/eval.nix --argstr attr packages.<system>.<attr> -o result`.
-- `trix run [<path>#attr]`: Builds the package (or app) and executes the
-  resulting binary.
+`trix` translates high-level flake intents into low-level Nix operations. When
+running a `trix` command, it actually invokes multiple Nix commands under the
+hood to build the desired output. These commands includes the experimental
+features flags for you (_some required functions requires flakes to be enabled,
+like [NixOS/nix#5541](https://github.com/NixOS/nix/issues/5541)_).
 
 ## Direnv Integration
 
@@ -92,24 +91,24 @@ switch between `trix` and official Flakes at any time.
 
 1. Add to your `~/.config/direnv/direnvrc`:
 
-    ```bash
-    # If installed via nix profile:
-    source ~/.nix-profile/share/trix/direnvrc
-    # Or with a direct store path:
-    source /nix/store/...-trix-0.1.0/share/trix/direnvrc
-    ```
+   ```bash
+   # If installed via nix profile:
+   source ~/.nix-profile/share/trix/direnvrc
+   # Or with a direct store path:
+   source /nix/store/...-trix-0.1.0/share/trix/direnvrc
+   ```
 
 2. In your project's `.envrc`:
-    ```bash
-    use trix
-    # or for a specific devShell:
-    use trix .#myshell
-    ```
+   ```bash
+   use trix
+   # or for a specific devShell:
+   use trix .#myshell
+   ```
 
 ## Debugging
 
-`trix` uses structured logging via the `tracing` crate. Diagnostic information is
-printed to `stderr` to avoid interfering with command output.
+`trix` uses structured logging via the `tracing` crate. Diagnostic information
+is printed to `stderr` to avoid interfering with command output.
 
 ### Verbose Mode
 
@@ -136,9 +135,9 @@ RUST_LOG=trace trix build
 
 ## See Also
 
-- [Nix Flakes](https://wiki.nixos.org/wiki/Flakes) - The experimental feature
+- [Nix Flakes](https://wiki.nixos.org/wiki/Flakes): The experimental feature
   `trix` provides an alternative for.
-- [flake-compat](https://github.com/edolstra/flake-compat) - Makes flake-based
+- [flake-compat](https://github.com/edolstra/flake-compat): Makes flake-based
   projects compatible with legacy Nix commands.
-- [unflake](https://codeberg.org/goldstein/unflake) - An alternative
-  implementation of a flake dependency resolver and runtime.
+- [unflake](https://codeberg.org/goldstein/unflake): An alternative dependency
+  resolver & runtime for Nix flakes.
