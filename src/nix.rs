@@ -315,8 +315,14 @@ pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Re
         cmd.args(["--command", command]);
     }
 
-    // Set up environment for bash prompt
+    // Set up environment for bash prompt and shell
     let mut env_overrides = HashMap::new();
+
+    // Set NIX_BUILD_SHELL to bash if not already set, to avoid nix-shell trying
+    // to get bashInteractive from <nixpkgs> (which fails without NIX_PATH set).
+    if env::var("NIX_BUILD_SHELL").is_err() {
+        env_overrides.insert("NIX_BUILD_SHELL".to_string(), "bash".to_string());
+    }
 
     if let Some(ref prompt) = options.bash_prompt {
         let escaped = prompt.replace('\'', "'\\''");
