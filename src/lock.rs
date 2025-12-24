@@ -840,10 +840,21 @@ pub fn sync_inputs(flake_dir: &Path, inputs: Option<serde_json::Value>) -> Resul
                 let follows_value: Vec<Value> =
                     follows_path.iter().map(|s| json!(s)).collect();
 
+                // Check if this follows entry already exists in the lock
+                let already_exists = lock_data
+                    .nodes
+                    .get("root")
+                    .and_then(|r| r.inputs.as_ref())
+                    .and_then(|i| i.get(name))
+                    .map(|existing| *existing == Value::Array(follows_value.clone()))
+                    .unwrap_or(false);
+
                 if let Some(root) = lock_data.nodes.get_mut("root") {
                     if let Some(ref mut root_inputs) = root.inputs {
                         root_inputs.insert(name.clone(), Value::Array(follows_value));
-                        added_follows.push((name.clone(), follows_path));
+                        if !already_exists {
+                            added_follows.push((name.clone(), follows_path));
+                        }
                     }
                 }
             }
