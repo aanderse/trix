@@ -216,7 +216,7 @@ pub fn get_system() -> Result<String> {
     }
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", "builtins.currentSystem", "--json"]);
+    cmd.args(["--eval", "--json", "--expr", "builtins.currentSystem"]);
 
     let system = cmd.json().unwrap_or_else(|_| get_fallback_system());
 
@@ -253,7 +253,7 @@ pub fn get_store_dir() -> Result<String> {
     }
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", "builtins.storeDir", "--json"]);
+    cmd.args(["--eval", "--json", "--expr", "builtins.storeDir"]);
 
     let store_dir = cmd.json().unwrap_or_else(|_| "/nix/store".to_string());
 
@@ -555,7 +555,7 @@ pub fn flake_has_attr(flake_dir: &Path, attr: &str) -> Result<bool> {
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", &nix_expr, "--read-write-mode"]);
+    cmd.args(["--eval", "--read-write-mode", "--expr", &nix_expr]);
 
     match cmd.output() {
         Ok(stdout) => Ok(stdout.trim() == "true"),
@@ -597,7 +597,7 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", &nix_expr, "--json", "--read-write-mode"]);
+    cmd.args(["--eval", "--json", "--read-write-mode", "--expr", &nix_expr]);
 
     let output = cmd.output()?;
     let program: Option<String> = serde_json::from_str(&output)?;
@@ -872,7 +872,7 @@ pub fn get_flake_output_categories(flake_dir: &Path) -> Result<Option<Vec<String
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", &expr, "--json", "--read-write-mode"]);
+    cmd.args(["--eval", "--json", "--read-write-mode", "--expr", &expr]);
 
     tracing::debug!("+ nix-instantiate --eval ... (getting output categories)");
 
@@ -1009,7 +1009,7 @@ mod tests {
 
     pub fn eval_expr(expr: &str) -> Result<serde_json::Value> {
         let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-        cmd.args(["--eval", "--expr", expr, "--json"]);
+        cmd.args(["--eval", "--json", "--expr", expr]);
         cmd.json()
     }
 }

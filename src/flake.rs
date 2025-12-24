@@ -308,7 +308,7 @@ pub fn get_flake_description(flake_dir: &Path) -> Option<String> {
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.args(["--eval", "--expr", &expr, "--json"]);
+    cmd.args(["--eval", "--json", "--expr", &expr]);
 
     cmd.json::<Option<String>>()
         .ok()
@@ -333,7 +333,7 @@ pub fn get_nix_config(flake_dir: &Path, warn_unsupported: bool) -> serde_json::V
 
     if warn_unsupported {
         let mut cmd_all = crate::command::NixCommand::new("nix-instantiate");
-        cmd_all.args(["--eval", "--expr", &expr_all, "--json"]);
+        cmd_all.args(["--eval", "--json", "--expr", &expr_all]);
 
         if let Ok(all_options) = cmd_all.json::<Vec<String>>() {
             for opt in all_options {
