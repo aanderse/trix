@@ -164,21 +164,19 @@ pub fn attr_to_nix_list(attr: &str) -> String {
 
 /// Generate the common Nix let-bindings for flake evaluation.
 ///
-/// Returns Nix code that sets up: system, flake, lock, inputs, outputs.
+/// Returns Nix code that sets up: flake, lock, inputs, outputs.
 /// Also includes the hasPath helper function.
 pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
     let nix_dir = get_nix_dir()?;
-    let system = get_system()?;
     let lock_expr = get_lock_expr(flake_dir);
     let self_info_expr = get_self_info_expr(flake_dir);
 
     Ok(format!(
         r#"
-      system = "{system}";
       flake = import {flake_dir}/flake.nix;
       lock = {lock_expr};
       inputs = import {nix_dir}/inputs.nix {{
-        inherit lock system;
+        inherit lock;
         flakeDirPath = {flake_dir};
         selfInfo = {self_info_expr};
       }};
@@ -200,7 +198,6 @@ pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
       getPath = path: obj:
         builtins.foldl' (o: k: o.${{k}}) obj path;
     "#,
-        system = system,
         flake_dir = flake_dir.display(),
         lock_expr = lock_expr,
         nix_dir = nix_dir.display(),
@@ -288,14 +285,12 @@ pub fn run_nix_build(
     capture_output: bool,
 ) -> Result<Option<String>> {
     let nix_dir = get_nix_dir()?;
-    let system = get_system()?;
     let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-build");
     cmd.arg(nix_dir.join("eval.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
-    cmd.args(["--argstr", "system", &system]);
     cmd.args(["--argstr", "attr", attr]);
 
     if let Some(ref store) = options.store {
@@ -342,15 +337,12 @@ pub struct ShellOptions {
 /// Run nix-shell with eval.nix wrapper. Replaces current process.
 pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Result<()> {
     let nix_dir = get_nix_dir()?;
-    let system = get_system()?;
     let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-shell");
     cmd.arg(nix_dir.join("eval.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
-
-    cmd.args(["--argstr", "system", &system]);
     cmd.args(["--argstr", "attr", attr]);
 
     if let Some(ref store) = options.store {
@@ -448,8 +440,8 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
 
           # Paths to try in order (matching nix eval behavior)
           pathsToTry = [
-            (["packages" system] ++ effectiveAttrPath)
-            (["legacyPackages" system] ++ effectiveAttrPath)
+            (["packages" builtins.currentSystem] ++ effectiveAttrPath)
+            (["legacyPackages" builtins.currentSystem] ++ effectiveAttrPath)
             effectiveAttrPath
           ];
 
@@ -615,7 +607,6 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
 /// Run nix repl with flake context loaded. Replaces current process.
 pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
     let nix_dir = get_nix_dir()?;
-    let system = get_system()?;
     let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix");
@@ -623,7 +614,6 @@ pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
     cmd.arg(nix_dir.join("repl.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
-    cmd.args(["--argstr", "system", &system]);
 
     cmd.exec()
 }
@@ -631,14 +621,12 @@ pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
 /// Get the derivation path for a flake attribute without building.
 pub fn get_derivation_path(flake_dir: &Path, attr: &str) -> Result<String> {
     let nix_dir = get_nix_dir()?;
-    let system = get_system()?;
     let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
     cmd.arg(nix_dir.join("eval.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
-    cmd.args(["--argstr", "system", &system]);
     cmd.args(["--argstr", "attr", attr]);
 
     cmd.output()
@@ -793,7 +781,7 @@ pub fn eval_flake_output_category(
                   if hasDerivations sysAttrs
                   then {{ _legacyOmitted = true; }}
                   else {{}}
-                else if sys == system || allSystemsFlag
+                else if sys == builtins.currentSystem || allSystemsFlag
                 then getDerivationNames sysAttrs
                 else {{ _omitted = true; }};
             }}) allSystems)
@@ -804,7 +792,7 @@ pub fn eval_flake_output_category(
             in builtins.listToAttrs (map (sys: {{
               name = sys;
               value =
-                if sys == system || allSystemsFlag
+                if sys == builtins.currentSystem || allSystemsFlag
                 then getDerivationInfo name val.${{sys}}
                 else getNames val.${{sys}};
             }}) allSystems)
@@ -815,7 +803,7 @@ pub fn eval_flake_output_category(
           in builtins.listToAttrs (map (sys: {{
             name = sys;
             value =
-              if sys == system || allSystemsFlag
+              if sys == builtins.currentSystem || allSystemsFlag
               then let drv = val.${{sys}}; in {{ _type = "formatter"; _name = drv.name or null; }}
               else {{ _omitted = true; }};
           }}) allSystems)

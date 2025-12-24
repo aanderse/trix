@@ -1,7 +1,7 @@
 # trix REPL wrapper
 #
 # Provides an interactive environment for exploring flakes.
-# Usage: nix repl --file repl.nix --arg flakeDir /path/to/flake --argstr system x86_64-linux --arg selfInfo '{}'
+# Usage: nix repl --file repl.nix --arg flakeDir /path/to/flake --arg selfInfo '{}'
 #
 # Exposes:
 #   self     - the flake with outputs
@@ -13,7 +13,6 @@
 
 {
   flakeDir, # Path to directory containing flake.nix (as string or path)
-  system, # Current system, e.g., "x86_64-linux"
   selfInfo ? { }, # Git metadata for self input (rev, shortRev, etc.)
 }:
 
@@ -47,7 +46,7 @@ let
   inputs =
     let
       baseInputs = import ./inputs.nix {
-        inherit lock flakeDirPath system selfInfo;
+        inherit lock flakeDirPath selfInfo;
       };
     in
     baseInputs
@@ -64,9 +63,9 @@ let
   # Convenience: expose nixpkgs as 'pkgs' if available
   pkgs =
     if
-      inputs ? nixpkgs && inputs.nixpkgs ? legacyPackages && inputs.nixpkgs.legacyPackages ? ${system}
+      inputs ? nixpkgs && inputs.nixpkgs ? legacyPackages && inputs.nixpkgs.legacyPackages ? ${builtins.currentSystem}
     then
-      inputs.nixpkgs.legacyPackages.${system}
+      inputs.nixpkgs.legacyPackages.${builtins.currentSystem}
     else
       null;
 

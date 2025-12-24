@@ -627,7 +627,6 @@ fn run_template_copy(target_dir: &std::path::Path, template_ref: &str, is_new: b
     }
 
     let nix_dir = crate::nix::get_nix_dir()?;
-    let system = get_system()?;
     let lock_expr = crate::nix::get_lock_expr(flake_path);
 
     // Evaluate template info
@@ -646,7 +645,6 @@ fn run_template_copy(target_dir: &std::path::Path, template_ref: &str, is_new: b
       inputs = import {}/inputs.nix {{
         inherit lock;
         flakeDirPath = {};
-        system = "{}";
         selfInfo = {{}};
       }};
       outputs = flake.outputs (inputs // {{ self = inputs.self // outputs; }});
@@ -657,7 +655,6 @@ fn run_template_copy(target_dir: &std::path::Path, template_ref: &str, is_new: b
         lock_expr,
         nix_dir.display(),
         flake_path.display(),
-        system,
         template_selector
     );
 
