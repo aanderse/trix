@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod command;
 pub mod flake;
+pub mod git;
 pub mod lock;
 pub mod nix;
 pub mod profile;
