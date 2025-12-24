@@ -701,6 +701,15 @@ pub fn eval_flake_output_category(
             {{ _type = "derivation"; _name = drv.name or null; }};
         }}) derivNames);
 
+      # Check if an attrset has any derivations (for legacyPackages)
+      hasDerivations = attrs:
+        let
+          names = builtins.attrNames attrs;
+          isDerivation = name:
+            let val = attrs.${{name}};
+            in builtins.isAttrs val && (val.type or null) == "derivation";
+        in builtins.any isDerivation names;
+
       # Process output category based on its type
       processCategory = name: val:
         if builtins.elem name perSystemAttrs && builtins.isAttrs val
@@ -708,14 +717,20 @@ pub fn eval_flake_output_category(
           if name == "legacyPackages"
           then
             # Special handling for legacyPackages - filter to derivations only
+            # Only show if there are actual derivations (not empty)
             let allSystems = builtins.attrNames val;
             in builtins.listToAttrs (map (sys: {{
               name = sys;
               value =
+                let sysAttrs = val.${{sys}}; in
                 if !showLegacyFlag
-                then {{ _legacyOmitted = true; }}
+                then
+                  # Only mark as omitted if there are actual derivations to show
+                  if hasDerivations sysAttrs
+                  then {{ _legacyOmitted = true; }}
+                  else {{}}
                 else if sys == system || allSystemsFlag
-                then getDerivationNames val.${{sys}}
+                then getDerivationNames sysAttrs
                 else {{ _omitted = true; }};
             }}) allSystems)
           else
