@@ -239,10 +239,19 @@ let
   ) rootInputs;
 
   # Build the 'self' input with inputs (flake-parts needs self.inputs and _type)
+  # sourceInfo only contains base metadata (matching nix behavior)
+  # Git-specific attributes (rev, shortRev, etc.) go at the top level of self, not in sourceInfo
+  sourceInfo = {
+    outPath = flakeDirPath;
+  }
+  // (if selfInfo ? lastModified then { inherit (selfInfo) lastModified; } else { })
+  // (if selfInfo ? lastModifiedDate then { inherit (selfInfo) lastModifiedDate; } else { });
+
   self = {
     outPath = flakeDirPath;
     inputs = lockedInputs;
     _type = "flake";
+    inherit sourceInfo;
   } // selfInfo;
 
 in

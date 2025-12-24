@@ -7,6 +7,7 @@ use std::path::Path;
 /// Matches Nix's behavior:
 /// - Clean repo: rev, shortRev, lastModified, lastModifiedDate, revCount
 /// - Dirty repo: dirtyRev, dirtyShortRev, lastModified, lastModifiedDate
+/// - Always: submodules
 #[derive(Debug, Clone, Default)]
 pub struct GitInfo {
     /// Full commit hash (only when clean)
@@ -23,6 +24,8 @@ pub struct GitInfo {
     pub last_modified_date: Option<String>,
     /// Number of commits (only when clean)
     pub rev_count: Option<i64>,
+    /// Whether the repository has submodules
+    pub submodules: bool,
 }
 
 /// Get git metadata for a directory using libgit2.
@@ -71,7 +74,17 @@ pub fn get_git_info(path: &Path) -> Result<GitInfo> {
         info.last_modified_date = Some(dt.format("%Y%m%d%H%M%S").to_string());
     }
 
+    // Check for submodules
+    info.submodules = has_submodules(&repo);
+
     Ok(info)
+}
+
+/// Check if the repository has any submodules.
+fn has_submodules(repo: &Repository) -> bool {
+    repo.submodules()
+        .map(|subs| !subs.is_empty())
+        .unwrap_or(false)
 }
 
 /// Check if the repository has uncommitted changes to tracked files.

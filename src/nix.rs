@@ -107,6 +107,7 @@ pub fn get_lock_expr(flake_dir: &Path) -> String {
 /// Matches Nix's behavior:
 /// - Clean repo: rev, shortRev, lastModified, lastModifiedDate, revCount
 /// - Dirty repo: dirtyRev, dirtyShortRev, lastModified, lastModifiedDate
+/// - Always: submodules
 pub fn get_self_info_expr(flake_dir: &Path) -> String {
     let git_info = crate::git::get_git_info(flake_dir).unwrap_or_default();
 
@@ -139,6 +140,10 @@ pub fn get_self_info_expr(flake_dir: &Path) -> String {
     if let Some(date) = git_info.last_modified_date {
         parts.push(format!("lastModifiedDate = \"{}\";", date));
     }
+    parts.push(format!(
+        "submodules = {};",
+        if git_info.submodules { "true" } else { "false" }
+    ));
 
     format!("{{ {} }}", parts.join(" "))
 }
