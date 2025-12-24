@@ -22,28 +22,36 @@ let
       pathKey = builtins.concatStringsSep "/" path;
       newVisited = visited ++ [ pathKey ];
       step =
-        nodeName: elem:
-        let
-          node = nodes.${nodeName};
-          ref = node.inputs.${elem} or (throw "trix: input '${elem}' not found in node '${nodeName}'");
-        in
-        if builtins.isString ref then
-          ref
+        acc: elem:
+        # If acc is already a resolved input (from nested follows), pass it through
+        if builtins.isAttrs acc then
+          acc
         else
-          # Another follows path - check for cycle before recursing
           let
-            refKey = builtins.concatStringsSep "/" ref;
+            node = nodes.${acc};
+            ref = node.inputs.${elem} or (throw "trix: input '${elem}' not found in node '${acc}'");
           in
-          if builtins.elem refKey newVisited then
-            throw "trix: circular follows detected: ${
-              builtins.concatStringsSep " -> " (newVisited ++ [ refKey ])
-            }"
+          if builtins.isString ref then
+            ref
           else
-            resolveFollowsWithVisited newVisited ref;
-      nodeName = builtins.foldl' step "root" path;
-      node = nodes.${nodeName};
+            # Another follows path - check for cycle before recursing
+            let
+              refKey = builtins.concatStringsSep "/" ref;
+            in
+            if builtins.elem refKey newVisited then
+              throw "trix: circular follows detected: ${
+                builtins.concatStringsSep " -> " (newVisited ++ [ refKey ])
+              }"
+            else
+              resolveFollowsWithVisited newVisited ref;
+      result = builtins.foldl' step "root" path;
     in
-    buildInput nodeName node flakeDirPath;
+    # If result is already a resolved input (attrset), return it directly
+    # Otherwise it's a node name that needs to be built
+    if builtins.isAttrs result then
+      result
+    else
+      buildInput result nodes.${result} flakeDirPath;
 
   resolveFollows = resolveFollowsWithVisited [ ];
 
