@@ -570,12 +570,27 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
     let attr_list = attr_to_nix_list(attr);
 
     // Evaluate the package to get mainProgram, pname, or name
+    // Uses getPathWithFallback to handle packages -> legacyPackages fallback
     let nix_expr = format!(
         r#"
     let
       {preamble}
+
+      # Get path with fallback from packages to legacyPackages
+      # (mirrors nix's behavior for flakes that only have legacyPackages)
+      getPathWithFallback = path: obj:
+        let
+          firstPart = builtins.head path;
+          restParts = builtins.tail path;
+          # Check if path starts with "packages" and that category doesn't exist
+          needsFallback = firstPart == "packages" && !(obj ? packages) && obj ? legacyPackages;
+          # Build fallback path with legacyPackages instead of packages
+          effectivePath = if needsFallback then [ "legacyPackages" ] ++ restParts else path;
+        in
+          builtins.foldl' (o: k: o.${{k}}) obj effectivePath;
+
       attrPath = {attr_list};
-      pkg = getPath attrPath outputs;
+      pkg = getPathWithFallback attrPath outputs;
       # Get mainProgram from meta, or fall back to pname/name
       mainProgram = pkg.meta.mainProgram or null;
       pname = pkg.pname or null;
