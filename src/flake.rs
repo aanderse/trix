@@ -438,7 +438,14 @@ pub fn resolve_installable(installable: &str) -> ResolvedInstallable {
 
     // Case 4: Registry name (e.g., "nixpkgs", "home-manager")
     if is_registry_name(ref_part) {
+        tracing::debug!("Looking up '{}' in flake registries...", ref_part);
         if let Some(entry) = resolve_registry_name(ref_part, true) {
+            tracing::debug!(
+                "Found '{}' in registry: type={}, path={:?}",
+                ref_part,
+                entry.entry_type,
+                entry.path
+            );
             if entry.entry_type == "path" {
                 // Local path from registry - handle natively!
                 let path = entry.path.unwrap_or_default();
