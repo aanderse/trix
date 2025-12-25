@@ -1,13 +1,26 @@
 use anyhow::{Context, Result};
 use git2::{Repository, StatusOptions};
-use std::path::Path;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Cache for git info per directory (canonical path -> GitInfo)
+static GIT_INFO_CACHE: Lazy<Mutex<HashMap<PathBuf, GitInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Git metadata for an input.
 ///
 /// Matches Nix's behavior:
-/// - Clean repo: rev, shortRev, lastModified, lastModifiedDate, revCount
+/// - Clean repo: rev, shortRev, lastModified, lastModifiedDate
 /// - Dirty repo: dirtyRev, dirtyShortRev, lastModified, lastModifiedDate
 /// - Always: submodules
+///
+/// Note: We intentionally do NOT compute `revCount`. Computing it requires
+/// walking the entire commit history, which takes ~4 seconds even with git's
+/// commit-graph optimization (or ~30 seconds with libgit2). Nix caches this
+/// per-commit in ~/.cache/nix/fetcher-cache-v4.sqlite, but we don't want to
+/// maintain a separate cache. Most flakes don't use revCount anyway, and Nix
+/// itself is moving toward not computing it by default for local repos.
 #[derive(Debug, Clone, Default)]
 pub struct GitInfo {
     /// Full commit hash (only when clean)
@@ -22,8 +35,6 @@ pub struct GitInfo {
     pub last_modified: Option<i64>,
     /// Formatted date string YYYYMMDDHHMMSS
     pub last_modified_date: Option<String>,
-    /// Number of commits (only when clean)
-    pub rev_count: Option<i64>,
     /// Whether the repository has submodules
     pub submodules: bool,
 }
@@ -32,12 +43,29 @@ pub struct GitInfo {
 ///
 /// Matches Nix's behavior where clean and dirty repos expose different attributes.
 /// Returns default (empty) GitInfo if the directory is not a git repository.
+/// Results are cached per canonical path.
 pub fn get_git_info(path: &Path) -> Result<GitInfo> {
+    // Canonicalize path for cache key
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    // Check cache first
+    {
+        let cache = GIT_INFO_CACHE.lock().unwrap();
+        if let Some(info) = cache.get(&canonical) {
+            tracing::debug!("get_git_info: cache hit");
+            return Ok(info.clone());
+        }
+    }
+
+    tracing::debug!("get_git_info: cache miss, computing...");
+    let start = std::time::Instant::now();
+
     // Try to open the repository; if it fails, it's not a git repo
     let repo = match Repository::discover(path) {
         Ok(r) => r,
         Err(_) => return Ok(GitInfo::default()),
     };
+    tracing::debug!("get_git_info: repo open took {:?}", start.elapsed());
 
     let mut info = GitInfo::default();
 
@@ -50,19 +78,21 @@ pub fn get_git_info(path: &Path) -> Result<GitInfo> {
 
     let rev = head.id().to_string();
     let short_rev: String = rev.chars().take(7).collect();
+    tracing::debug!("get_git_info: got HEAD in {:?}", start.elapsed());
 
     // Check for dirty status (tracked files only, matching Nix behavior)
+    let dirty_start = std::time::Instant::now();
     let is_dirty = is_repo_dirty(&repo)?;
+    tracing::debug!("get_git_info: is_repo_dirty={} took {:?}", is_dirty, dirty_start.elapsed());
 
     if is_dirty {
         // Dirty repo: only dirtyRev and dirtyShortRev
         info.dirty_rev = Some(format!("{}-dirty", rev));
         info.dirty_short_rev = Some(format!("{}-dirty", short_rev));
     } else {
-        // Clean repo: rev, shortRev, and revCount
+        // Clean repo: rev and shortRev
         info.rev = Some(rev.clone());
         info.short_rev = Some(short_rev);
-        info.rev_count = Some(count_commits(&repo, &head)?);
     }
 
     // Get last modified time (always included)
@@ -77,6 +107,12 @@ pub fn get_git_info(path: &Path) -> Result<GitInfo> {
     // Check for submodules
     info.submodules = has_submodules(&repo);
 
+    // Cache the result
+    {
+        let mut cache = GIT_INFO_CACHE.lock().unwrap();
+        cache.insert(canonical, info.clone());
+    }
+
     Ok(info)
 }
 
@@ -88,7 +124,43 @@ fn has_submodules(repo: &Repository) -> bool {
 }
 
 /// Check if the repository has uncommitted changes to tracked files.
+///
+/// Tries `git status` first (fast), falls back to libgit2 if git isn't available.
 fn is_repo_dirty(repo: &Repository) -> Result<bool> {
+    // Try fast path: shell out to git
+    if let Some(workdir) = repo.workdir() {
+        if let Ok(dirty) = is_repo_dirty_git(workdir) {
+            return Ok(dirty);
+        }
+    }
+
+    // Fallback: use libgit2
+    is_repo_dirty_libgit2(repo)
+}
+
+/// Check dirty status using `git status` (fast).
+fn is_repo_dirty_git(repo_path: &Path) -> Result<bool> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &repo_path.display().to_string(),
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+        ])
+        .output()
+        .context("Failed to run git status")?;
+
+    if !output.status.success() {
+        anyhow::bail!("git status failed");
+    }
+
+    // If output is empty, repo is clean
+    Ok(!output.stdout.is_empty())
+}
+
+/// Check dirty status using libgit2 (fallback).
+fn is_repo_dirty_libgit2(repo: &Repository) -> Result<bool> {
     let mut opts = StatusOptions::new();
     // Only check tracked files (no untracked), matching Nix behavior
     opts.include_untracked(false)
@@ -100,15 +172,4 @@ fn is_repo_dirty(repo: &Repository) -> Result<bool> {
         .context("Failed to get repository status")?;
 
     Ok(!statuses.is_empty())
-}
-
-/// Count the number of commits reachable from HEAD.
-fn count_commits(repo: &Repository, head: &git2::Commit) -> Result<i64> {
-    let mut revwalk = repo.revwalk().context("Failed to create revwalk")?;
-    revwalk
-        .push(head.id())
-        .context("Failed to push HEAD to revwalk")?;
-
-    let count = revwalk.count() as i64;
-    Ok(count)
 }

@@ -1,10 +1,17 @@
 //! Flake handling - parsing, URL resolution, lock management.
 
 use anyhow::Result;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::registry::{is_registry_name, registry_entry_to_flake_ref, resolve_registry_name};
+
+/// Cache for flake inputs per directory (canonical path -> inputs JSON)
+static FLAKE_INPUTS_CACHE: Lazy<Mutex<HashMap<PathBuf, serde_json::Value>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Result of resolving an installable reference.
 ///
@@ -159,7 +166,21 @@ pub fn parse_flake_url(url: &str) -> FlakeSource {
 /// Extract inputs from flake.nix by evaluating with nix-instantiate.
 ///
 /// Returns a map of input names to their specs.
+/// Results are cached per canonical path.
 pub fn get_flake_inputs(flake_dir: &Path) -> Result<serde_json::Value> {
+    // Canonicalize path for cache key
+    let canonical = flake_dir
+        .canonicalize()
+        .unwrap_or_else(|_| flake_dir.to_path_buf());
+
+    // Check cache first
+    {
+        let cache = FLAKE_INPUTS_CACHE.lock().unwrap();
+        if let Some(inputs) = cache.get(&canonical) {
+            return Ok(inputs.clone());
+        }
+    }
+
     let expr = format!(
         r#"
     let
@@ -297,7 +318,15 @@ pub fn get_flake_inputs(flake_dir: &Path) -> Result<serde_json::Value> {
         }
     }
 
-    Ok(serde_json::Value::Object(parsed))
+    let result = serde_json::Value::Object(parsed);
+
+    // Cache the result
+    {
+        let mut cache = FLAKE_INPUTS_CACHE.lock().unwrap();
+        cache.insert(canonical, result.clone());
+    }
+
+    Ok(result)
 }
 
 /// Extract description from flake.nix.
@@ -463,6 +492,11 @@ pub fn resolve_installable(installable: &str) -> ResolvedInstallable {
             } else {
                 // Remote ref from registry - passthrough to nix
                 let flake_ref = registry_entry_to_flake_ref(&entry);
+                tracing::debug!(
+                    "Registry '{}' resolved to remote ref: {}",
+                    ref_part,
+                    flake_ref
+                );
                 return ResolvedInstallable {
                     is_local: false,
                     attr_part,
@@ -472,6 +506,7 @@ pub fn resolve_installable(installable: &str) -> ResolvedInstallable {
             }
         } else {
             // Registry name not found - still try as remote ref
+            tracing::debug!("'{}' not found in any registry", ref_part);
             return ResolvedInstallable {
                 is_local: false,
                 attr_part,

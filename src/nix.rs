@@ -105,9 +105,11 @@ pub fn get_lock_expr(flake_dir: &Path) -> String {
 /// Get the Nix expression for the 'self' input metadata.
 ///
 /// Matches Nix's behavior:
-/// - Clean repo: rev, shortRev, lastModified, lastModifiedDate, revCount
+/// - Clean repo: rev, shortRev, lastModified, lastModifiedDate
 /// - Dirty repo: dirtyRev, dirtyShortRev, lastModified, lastModifiedDate
 /// - Always: submodules
+///
+/// Note: revCount is intentionally omitted (see git.rs for explanation).
 pub fn get_self_info_expr(flake_dir: &Path) -> String {
     let git_info = crate::git::get_git_info(flake_dir).unwrap_or_default();
 
@@ -120,9 +122,6 @@ pub fn get_self_info_expr(flake_dir: &Path) -> String {
     }
     if let Some(short_rev) = git_info.short_rev {
         parts.push(format!("shortRev = \"{}\";", short_rev));
-    }
-    if let Some(count) = git_info.rev_count {
-        parts.push(format!("revCount = {};", count));
     }
 
     // Dirty repo attributes
