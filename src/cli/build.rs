@@ -226,13 +226,12 @@ pub fn cmd_run(
     let status = cmd
         .status()
         .context(format!("Failed to run {}", exe_path))?;
-    if !status.success() {
-        anyhow::bail!(
-            "Command failed with exit code: {}",
-            status.code().unwrap_or(1)
-        );
+    if status.success() {
+        Ok(())
+    } else {
+        // Exit silently with the same code - the application already printed its error
+        std::process::exit(status.code().unwrap_or(1))
     }
-    Ok(())
 }
 
 /// Copy a package to another store
