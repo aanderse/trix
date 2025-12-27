@@ -687,7 +687,8 @@ pub fn eval_flake_outputs(
                 Ok(val) => (cat, val),
                 Err(e) => {
                     tracing::debug!("Error evaluating category {}: {}", cat, e);
-                    (cat, None)
+                    // Return unknown marker instead of None so the category still shows
+                    (cat, Some(serde_json::json!({ "_unknown": true })))
                 }
             }
         })
@@ -776,6 +777,44 @@ pub fn eval_flake_output_category(
             in builtins.isAttrs val && (val.type or null) == "derivation";
         in builtins.any isDerivation names;
 
+      # Recursively process an arbitrary nested attrset (for hydraJobs, etc.)
+      # Returns nested structure with derivation info at leaves
+      # Uses tryEval to handle evaluation errors gracefully
+      processNestedAttrs = depth: attrs:
+        let
+          # Try to get attr names, fail gracefully if evaluation errors
+          namesResult = builtins.tryEval (builtins.attrNames attrs);
+        in
+        if !namesResult.success then
+          {{ _unknown = true; }}
+        else
+          builtins.listToAttrs (map (name:
+            let
+              # Try to evaluate the value
+              valResult = builtins.tryEval attrs.${{name}};
+            in {{
+              inherit name;
+              value =
+                if !valResult.success then
+                  {{ _unknown = true; }}
+                else
+                  let val = valResult.value; in
+                  if builtins.isAttrs val then
+                    if (val.type or null) == "derivation" then
+                      {{ _type = "derivation"; _name = val.name or null; }}
+                    else if val ? type && val.type == "app" then
+                      {{ _type = "app"; _program = val.program or null; }}
+                    else
+                      # Recurse into nested attrset (with depth limit to avoid infinite recursion)
+                      if depth < 10 then
+                        processNestedAttrs (depth + 1) val
+                      else
+                        {{ _unknown = true; }}
+                  else
+                    # Non-attrset leaf (function, string, etc.)
+                    {{ _unknown = true; }};
+            }}) namesResult.value);
+
       # Process output category based on its type
       processCategory = name: val:
         if builtins.elem name perSystemAttrs && builtins.isAttrs val
@@ -784,20 +823,33 @@ pub fn eval_flake_output_category(
           then
             # Special handling for legacyPackages - filter to derivations only
             # Only show if there are actual derivations (not empty)
+            # Use tryEval to handle evaluation errors gracefully
             let allSystems = builtins.attrNames val;
             in builtins.listToAttrs (map (sys: {{
               name = sys;
               value =
-                let sysAttrs = val.${{sys}}; in
-                if !showLegacyFlag
-                then
-                  # Only mark as omitted if there are actual derivations to show
-                  if hasDerivations sysAttrs
-                  then {{ _legacyOmitted = true; }}
-                  else {{}}
-                else if sys == builtins.currentSystem || allSystemsFlag
-                then getDerivationNames sysAttrs
-                else {{ _omitted = true; }};
+                let
+                  sysAttrsResult = builtins.tryEval val.${{sys}};
+                in
+                if !sysAttrsResult.success
+                then {{ _omitted = true; }}
+                else
+                  let sysAttrs = sysAttrsResult.value; in
+                  if !showLegacyFlag
+                  then
+                    # Mark as legacy omitted - the --legacy flag is what shows these
+                    # Use tryEval but default to showing the omit message
+                    let hasDerivResult = builtins.tryEval (hasDerivations sysAttrs);
+                    in if hasDerivResult.success && !hasDerivResult.value
+                    then {{}}  # No derivations, don't show anything
+                    else {{ _legacyOmitted = true; }}  # Has derivations or check failed
+                  else if sys == builtins.currentSystem || allSystemsFlag
+                  then
+                    let derivNamesResult = builtins.tryEval (getDerivationNames sysAttrs);
+                    in if derivNamesResult.success
+                    then derivNamesResult.value
+                    else {{ _omitted = true; }}
+                  else {{ _omitted = true; }};
             }}) allSystems)
           else
             # Regular per-system categories (packages, devShells, checks, apps)
@@ -846,7 +898,16 @@ pub fn eval_flake_output_category(
           value = {{ _type = "configuration"; }};
         }}) (builtins.attrNames val))
 
-        else {{ _unknown = true; }};
+        # For any other attrset (hydraJobs, library, custom outputs, etc.),
+        # recursively process to find derivations
+        # Use tryEval because some outputs may fail during evaluation
+        else
+          let
+            isAttrsResult = builtins.tryEval (builtins.isAttrs val);
+          in
+          if isAttrsResult.success && isAttrsResult.value
+          then processNestedAttrs 0 val
+          else {{ _unknown = true; }};
 
     in if outputs ? "{category}" then processCategory "{category}" outputs."{category}" else {{}}
     "#,

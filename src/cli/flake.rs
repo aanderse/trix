@@ -423,24 +423,24 @@ fn format_output_description(info: &serde_json::Map<String, serde_json::Value>) 
     match type_val {
         "derivation" => {
             if let Some(name) = name_val {
-                // Use category to determine if this is a dev shell
-                if category == Some("devShells") {
-                    format!("development environment '{}'", name)
-                } else if category == Some("checks") {
-                    format!("check: '{}'", name)
-                } else {
-                    format!("package '{}'", name)
+                // Use category to determine display format (matching nix flake show output)
+                match category {
+                    Some("devShells") => format!("development environment '{}'", name),
+                    Some("packages") => format!("package '{}'", name),
+                    // checks, hydraJobs, and other categories use "derivation"
+                    _ => format!("derivation '{}'", name),
                 }
             } else {
-                "package".to_string()
+                "derivation".to_string()
             }
         }
         "app" => "app".to_string(),
         "formatter" => {
+            // nix uses "package" for formatter, not "formatter:"
             if let Some(name) = name_val {
-                format!("formatter: '{}'", name)
+                format!("package '{}'", name)
             } else {
-                "formatter".to_string()
+                "package".to_string()
             }
         }
         "overlay" => magenta_bold("Nixpkgs overlay"),
