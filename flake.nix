@@ -28,6 +28,14 @@
         }
       );
 
+      formatter = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        pkgs.nixfmt-tree
+      );
+
       devShells = forAllSystems (
         system:
         let
