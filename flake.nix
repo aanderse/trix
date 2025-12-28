@@ -2,53 +2,52 @@
   description = "trick yourself into flakes";
 
   inputs = {
-    nixpkgs.url = "github:/nixos/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   };
 
   outputs =
-    { self, nixpkgs }:
+    inputs:
     let
-      supportedSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
-      ];
-      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      forAllSystems =
+        fn:
+        inputs.nixpkgs.lib.genAttrs inputs.nixpkgs.lib.systems.flakeExposed (
+          system:
+          fn (
+            import inputs.nixpkgs {
+              inherit system;
+            }
+          )
+        );
     in
     {
       packages = forAllSystems (
-        system:
+        pkgs:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
-        {
           trix = pkgs.callPackage ./package.nix { };
-          default = self.packages.${system}.trix;
-        }
-      );
-
-      devShells = forAllSystems (
-        system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              clippy
-              rust-analyzer
-              rustc
-              rustfmt
-            ];
-
-            shellHook = ''
-              export PATH=$PWD/target/debug:$PATH
-              export RUST_SRC_PATH="${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
-            '';
-          };
+          inherit trix;
+          default = trix;
         }
       );
+
+      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = with pkgs; [
+            cargo
+            clippy
+            rust-analyzer
+            rustc
+            rustfmt
+          ];
+
+          shellHook = ''
+            export PATH=$PWD/target/debug:$PATH
+            export RUST_SRC_PATH="${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
+          '';
+        };
+      });
     };
 }
