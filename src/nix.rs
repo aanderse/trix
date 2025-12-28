@@ -531,30 +531,15 @@ pub fn flake_has_attr(flake_dir: &Path, attr: &str) -> Result<bool> {
 /// Checks meta.mainProgram, then pname, then name (with version stripped).
 pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> {
     let preamble = flake_eval_preamble(flake_dir)?;
-    let attr_list = attr_to_nix_list(attr);
 
     // Evaluate the package to get mainProgram, pname, or name
-    // Uses getPathWithFallback to handle packages -> legacyPackages fallback
+    // Uses resolveAttrPath from helpers.nix for packages -> legacyPackages fallback
     let nix_expr = format!(
         r#"
     let
       {preamble}
 
-      # Get path with fallback from packages to legacyPackages
-      # (mirrors nix's behavior for flakes that only have legacyPackages)
-      getPathWithFallback = path: obj:
-        let
-          firstPart = builtins.head path;
-          restParts = builtins.tail path;
-          # Check if path starts with "packages" and that category doesn't exist
-          needsFallback = firstPart == "packages" && !(obj ? packages) && obj ? legacyPackages;
-          # Build fallback path with legacyPackages instead of packages
-          effectivePath = if needsFallback then [ "legacyPackages" ] ++ restParts else path;
-        in
-          builtins.foldl' (o: k: o.${{k}}) obj effectivePath;
-
-      attrPath = {attr_list};
-      pkg = getPathWithFallback attrPath outputs;
+      pkg = resolveAttrPath "{attr}" outputs;
       # Get mainProgram from meta, or fall back to pname/name
       mainProgram = pkg.meta.mainProgram or null;
       pname = pkg.pname or null;
@@ -572,7 +557,7 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
       else null
     "#,
         preamble = preamble,
-        attr_list = attr_list,
+        attr = attr,
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
@@ -698,6 +683,10 @@ pub fn eval_flake_output_category(
 
       # Template categories
       templateAttrs = [ "templates" ];
+
+      # Categories that are known to NOT contain derivations (mark as unknown immediately)
+      # This avoids expensive recursive evaluation of things like nixpkgs.lib
+      nonDerivationAttrs = [ "lib" "library" "htmlDocs" "formatterModule" ];
 
       # Get derivation info for current system (extracts name for version display)
       # category parameter is used to determine the output type (devShells vs packages)
@@ -863,9 +852,13 @@ pub fn eval_flake_output_category(
           value = {{ _type = "configuration"; }};
         }}) (builtins.attrNames val))
 
-        # For any other attrset (hydraJobs, library, custom outputs, etc.),
+        # For categories known to not contain derivations (lib, htmlDocs, etc.), mark as unknown
+        else if builtins.elem name nonDerivationAttrs
+        then
+          {{ _unknown = true; }}
+
+        # For any other attrset (hydraJobs, custom outputs, etc.),
         # recursively process to find derivations
-        # Use tryEval because some outputs may fail during evaluation
         else
           let
             isAttrsResult = builtins.tryEval (builtins.isAttrs val);
