@@ -85,6 +85,20 @@ hood to build the desired output. These commands includes the experimental
 features flags for you (_some required functions requires flakes to be enabled,
 like [NixOS/nix#5541](https://github.com/NixOS/nix/issues/5541)_).
 
+## How to use
+
+The recommended way to install `trix` is by using the provided
+[overlay](https://wiki.nixos.org/wiki/Overlays)
+(`inputs.trix.overlays.default`). This ensures you get the correct version and
+dependencies integrated into your package set. Once added, you can install
+`trix` using your preferred method.
+
+You can also run it with `nix run` directly from the flake:
+
+```shell
+nix run github:aanderse/trix
+```
+
 ## Direnv Integration
 
 `trix` includes a `direnv` library for seamless environment activation.

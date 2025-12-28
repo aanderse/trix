@@ -15,6 +15,9 @@
           fn (
             import inputs.nixpkgs {
               inherit system;
+              overlays = [
+                inputs.self.overlays.default
+              ];
             }
           )
         );
@@ -22,12 +25,9 @@
     {
       packages = forAllSystems (
         pkgs:
-        let
-          trix = pkgs.callPackage ./package.nix { };
-        in
         {
-          inherit trix;
-          default = trix;
+          inherit (pkgs) trix;
+          default = pkgs.trix;
         }
       );
 
@@ -49,5 +49,9 @@
           '';
         };
       });
+
+      overlays.default = final: prev: {
+        trix = final.callPackage ./package.nix { };
+      };
     };
 }
