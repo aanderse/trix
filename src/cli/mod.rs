@@ -1,6 +1,7 @@
 //! CLI module exports and shared utilities.
 
 pub mod common;
+pub mod style;
 
 #[path = "build/command.rs"]
 pub mod build;

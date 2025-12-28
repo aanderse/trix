@@ -29,7 +29,7 @@ fn test_flake_init_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "Create a flake in the current directory",
+            "Initialize a new flake in the current directory",
         ));
 }
 

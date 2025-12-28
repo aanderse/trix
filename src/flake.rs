@@ -181,39 +181,10 @@ pub fn get_flake_inputs(flake_dir: &Path) -> Result<serde_json::Value> {
         }
     }
 
+    let nix_dir = crate::nix::get_nix_dir()?;
     let expr = format!(
-        r#"
-    let
-      flake = import {}/flake.nix;
-      inputs = flake.inputs or {{}};
-
-      # Extract info for a single input
-      getInputInfo = name:
-        let
-          input = inputs.${{name}};
-          # Handle both attrset inputs and string shorthand
-          inputAttrs = if builtins.isAttrs input then input else {{ url = input; }};
-        in {{
-          inherit name;
-          url = inputAttrs.url or null;
-          follows = inputAttrs.follows or null;
-          flake = inputAttrs.flake or true;
-          # Get nested input follows (inputs.foo.inputs.bar.follows)
-          nestedFollows =
-            if inputAttrs ? inputs then
-              builtins.listToAttrs (
-                builtins.filter (x: x.value != null) (
-                  map (nestedName: {{
-                    name = nestedName;
-                    value = inputAttrs.inputs.${{nestedName}}.follows or null;
-                  }}) (builtins.attrNames inputAttrs.inputs)
-                )
-              )
-            else {{}};
-        }};
-
-    in map getInputInfo (builtins.attrNames inputs)
-    "#,
+        "import {}/flake_inputs.nix {{ flakePath = {}; }}",
+        nix_dir.display(),
         flake_dir.display()
     );
 
@@ -374,17 +345,10 @@ pub fn get_nix_config(flake_dir: &Path, warn_unsupported: bool) -> serde_json::V
     }
 
     // Now get the supported options
+    let nix_dir = crate::nix::get_nix_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let expr = format!(
-        r#"
-    let
-      flake = import {}/flake.nix;
-      cfg = flake.nixConfig or {{}};
-    in {{
-      bash-prompt = cfg.bash-prompt or null;
-      bash-prompt-prefix = cfg.bash-prompt-prefix or null;
-      bash-prompt-suffix = cfg.bash-prompt-suffix or null;
-    }}
-    "#,
+        "import {}/flake_config.nix {{ flakePath = {}; }}",
+        nix_dir.display(),
         flake_dir.display()
     );
 

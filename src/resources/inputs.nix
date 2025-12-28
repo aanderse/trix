@@ -48,10 +48,7 @@ let
     in
     # If result is already a resolved input (attrset), return it directly
     # Otherwise it's a node name that needs to be built
-    if builtins.isAttrs result then
-      result
-    else
-      buildInput result nodes.${result} flakeDirPath;
+    if builtins.isAttrs result then result else buildInput result nodes.${result} flakeDirPath;
 
   resolveFollows = resolveFollowsWithVisited [ ];
 
@@ -251,7 +248,8 @@ let
     inputs = lockedInputs;
     _type = "flake";
     inherit sourceInfo;
-  } // selfInfo;
+  }
+  // selfInfo;
 
 in
 { inherit self; } // lockedInputs
