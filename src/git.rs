@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Cache for git info per directory (canonical path -> GitInfo)
-static GIT_INFO_CACHE: Lazy<Mutex<HashMap<PathBuf, GitInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static GIT_INFO_CACHE: Lazy<Mutex<HashMap<PathBuf, GitInfo>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Git metadata for an input.
 ///
@@ -83,7 +84,11 @@ pub fn get_git_info(path: &Path) -> Result<GitInfo> {
     // Check for dirty status (tracked files only, matching Nix behavior)
     let dirty_start = std::time::Instant::now();
     let is_dirty = is_repo_dirty(&repo)?;
-    tracing::debug!("get_git_info: is_repo_dirty={} took {:?}", is_dirty, dirty_start.elapsed());
+    tracing::debug!(
+        "get_git_info: is_repo_dirty={} took {:?}",
+        is_dirty,
+        dirty_start.elapsed()
+    );
 
     if is_dirty {
         // Dirty repo: only dirtyRev and dirtyShortRev

@@ -837,8 +837,7 @@ pub fn sync_inputs(flake_dir: &Path, inputs: Option<serde_json::Value>) -> Resul
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
-                let follows_value: Vec<Value> =
-                    follows_path.iter().map(|s| json!(s)).collect();
+                let follows_value: Vec<Value> = follows_path.iter().map(|s| json!(s)).collect();
 
                 // Check if this follows entry already exists in the lock
                 let already_exists = lock_data
@@ -1268,7 +1267,12 @@ pub fn update_lock(
             }
 
             // Collect transitive dependencies
-            collect_transitive_deps(&mut new_node, &name, &mut lock_data.nodes, &mut added_inputs);
+            collect_transitive_deps(
+                &mut new_node,
+                &name,
+                &mut lock_data.nodes,
+                &mut added_inputs,
+            );
 
             lock_data.nodes.insert(name.clone(), new_node);
 
