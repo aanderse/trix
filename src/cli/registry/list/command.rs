@@ -1,10 +1,5 @@
-//! Registry subcommands.
-
+use crate::registry::{list_all_registries, registry_entry_to_flake_ref};
 use anyhow::Result;
-
-use crate::registry::{
-    add_registry_entry, list_all_registries, registry_entry_to_flake_ref, remove_registry_entry,
-};
 
 /// List all registry entries
 pub fn cmd_list(no_global: bool) -> Result<()> {
@@ -44,40 +39,6 @@ pub fn cmd_list(no_global: bool) -> Result<()> {
                 }
             }
         }
-    }
-
-    Ok(())
-}
-
-/// Add or update a registry entry
-pub fn cmd_add(name: &str, target: &str) -> Result<()> {
-    add_registry_entry(name, target)?;
-
-    // Show what was added
-    if let Some(entry) = crate::registry::resolve_registry_name(name, false) {
-        let flake_ref = registry_entry_to_flake_ref(&entry);
-        if entry.entry_type == "path" {
-            println!(
-                "Added: {} -> {} (local, handled natively by trix)",
-                name, flake_ref
-            );
-        } else {
-            println!(
-                "Added: {} -> {} (remote, passthrough to nix)",
-                name, flake_ref
-            );
-        }
-    }
-
-    Ok(())
-}
-
-/// Remove a registry entry
-pub fn cmd_remove(name: &str) -> Result<()> {
-    if remove_registry_entry(name)? {
-        println!("Removed: {}", name);
-    } else {
-        anyhow::bail!("Entry '{}' not found in user registry.", name);
     }
 
     Ok(())

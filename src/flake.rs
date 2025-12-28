@@ -563,7 +563,11 @@ pub fn resolve_attr_path(attr_part: &str, default_category: &str, system: &str) 
     // Simple name like "hello" or "default" - most common case
     // Empty attr_part (from ".#") defaults to "default"
     if !attr_part.contains('.') {
-        let name = if attr_part.is_empty() { "default" } else { attr_part };
+        let name = if attr_part.is_empty() {
+            "default"
+        } else {
+            attr_part
+        };
         return format!("{}.{}.{}", default_category, system, name);
     }
 
