@@ -3,6 +3,17 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
+fn test_hash_help() {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("trix");
+    cmd.args(["hash", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Compute and convert cryptographic hashes",
+        ));
+}
+
+#[test]
 fn test_cli_help() {
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("trix");
     cmd.arg("--help")

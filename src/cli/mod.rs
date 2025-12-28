@@ -3,6 +3,7 @@
 pub mod build;
 pub mod eval;
 pub mod flake;
+pub mod hash;
 pub mod profile;
 pub mod registry;
 

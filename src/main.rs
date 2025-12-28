@@ -203,6 +203,10 @@ enum Commands {
     #[command(subcommand)]
     Registry(RegistryCommands),
 
+    /// Compute and convert cryptographic hashes
+    #[command(subcommand)]
+    Hash(cli::hash::HashCommands),
+
     /// Format files using the flake's formatter
     #[command(name = "fmt")]
     Fmt {
@@ -590,6 +594,8 @@ fn run(cli: Cli) -> Result<()> {
 
             RegistryCommands::Remove { name } => cli::registry::cmd_remove(&name),
         },
+
+        Commands::Hash(hash_cmd) => cli::hash::cmd_hash(hash_cmd),
 
         Commands::Fmt {
             installable,
