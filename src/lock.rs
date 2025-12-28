@@ -8,50 +8,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::IsTerminal;
+
 use std::path::Path;
 
+use crate::cli::style::*;
 use crate::flake::get_flake_inputs;
 
 // ============================================================================
 // ANSI color helpers (matching nix's style)
 // ============================================================================
-
-fn use_color() -> bool {
-    std::io::stderr().is_terminal()
-}
-
-fn yellow(text: &str) -> String {
-    if use_color() {
-        format!("\x1b[1;33m{}\x1b[0m", text)
-    } else {
-        text.to_string()
-    }
-}
-
-fn magenta(text: &str) -> String {
-    if use_color() {
-        format!("\x1b[1;35m{}\x1b[0m", text)
-    } else {
-        text.to_string()
-    }
-}
-
-fn cyan(text: &str) -> String {
-    if use_color() {
-        format!("\x1b[36m{}\x1b[0m", text)
-    } else {
-        text.to_string()
-    }
-}
-
-fn bold(text: &str) -> String {
-    if use_color() {
-        format!("\x1b[1m{}\x1b[0m", text)
-    } else {
-        text.to_string()
-    }
-}
 
 /// Format a locked node as a display URL with date (matching nix's format).
 fn format_locked_url(node: &LockNode) -> String {

@@ -4,20 +4,22 @@
 
 rec {
   # Check if a nested path exists in an attrset
-  hasPath = path: obj:
+  hasPath =
+    path: obj:
     let
       attempt = builtins.tryEval (
-        if path == [] then true
-        else if builtins.isAttrs obj && (obj ? ${builtins.head path})
-        then hasPath (builtins.tail path) obj.${builtins.head path}
-        else false
+        if path == [ ] then
+          true
+        else if builtins.isAttrs obj && (obj ? ${builtins.head path}) then
+          hasPath (builtins.tail path) obj.${builtins.head path}
+        else
+          false
       );
     in
-      attempt.success && attempt.value;
+    attempt.success && attempt.value;
 
   # Get a value at a nested path
-  getPath = path: obj:
-    builtins.foldl' (o: k: o.${k}) obj path;
+  getPath = path: obj: builtins.foldl' (o: k: o.${k}) obj path;
 
   # Resolve an attribute path with fallbacks.
   # Mirrors nix's behavior for .#attr references:
@@ -30,7 +32,8 @@ rec {
   #   outputs: the flake outputs attrset
   #
   # Returns the resolved value or throws if not found.
-  resolveAttrPath = path: outputs:
+  resolveAttrPath =
+    path: outputs:
     let
       raw = builtins.split "\\." path;
       parts = builtins.filter (x: builtins.isString x && x != "") raw;
@@ -39,13 +42,17 @@ rec {
       system = builtins.currentSystem;
 
       # Check if this looks like a per-system category (has system in second position)
-      looksLikePerSystem = builtins.length parts >= 2 &&
-        builtins.match ".*-.*" (builtins.elemAt parts 1) != null;
+      looksLikePerSystem =
+        builtins.length parts >= 2 && builtins.match ".*-.*" (builtins.elemAt parts 1) != null;
 
       # Known per-system categories
-      startsWithKnownCategory = firstPart == "packages" || firstPart == "legacyPackages" ||
-        firstPart == "devShells" || firstPart == "apps" || firstPart == "checks" ||
-        firstPart == "formatter";
+      startsWithKnownCategory =
+        firstPart == "packages"
+        || firstPart == "legacyPackages"
+        || firstPart == "devShells"
+        || firstPart == "apps"
+        || firstPart == "checks"
+        || firstPart == "formatter";
 
       # Paths to try for unknown first component (not a known category)
       pathsToTry =
@@ -55,24 +62,47 @@ rec {
             needsFallback = firstPart == "packages" && !(outputs ? packages) && outputs ? legacyPackages;
             fallbackParts = [ "legacyPackages" ] ++ restParts;
           in
-            if needsFallback then [ fallbackParts ] else [ parts ]
+          if needsFallback then [ fallbackParts ] else [ parts ]
         else if startsWithKnownCategory then
           # Has category but no system, insert system
-          [ ([ firstPart system ] ++ restParts) ]
+          [
+            (
+              [
+                firstPart
+                system
+              ]
+              ++ restParts
+            )
+          ]
         else
           # Unknown first component - try packages, legacyPackages, then direct
           [
-            ([ "packages" system ] ++ parts)
-            ([ "legacyPackages" system ] ++ parts)
+            (
+              [
+                "packages"
+                system
+              ]
+              ++ parts
+            )
+            (
+              [
+                "legacyPackages"
+                system
+              ]
+              ++ parts
+            )
             parts
           ];
 
       # Find the first valid path
-      findFirstValid = paths:
-        if paths == [] then null
-        else if hasPath (builtins.head paths) outputs
-        then builtins.head paths
-        else findFirstValid (builtins.tail paths);
+      findFirstValid =
+        paths:
+        if paths == [ ] then
+          null
+        else if hasPath (builtins.head paths) outputs then
+          builtins.head paths
+        else
+          findFirstValid (builtins.tail paths);
 
       resultPath = findFirstValid pathsToTry;
     in

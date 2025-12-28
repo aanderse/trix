@@ -63,7 +63,9 @@ let
   # Convenience: expose nixpkgs as 'pkgs' if available
   pkgs =
     if
-      inputs ? nixpkgs && inputs.nixpkgs ? legacyPackages && inputs.nixpkgs.legacyPackages ? ${builtins.currentSystem}
+      inputs ? nixpkgs
+      && inputs.nixpkgs ? legacyPackages
+      && inputs.nixpkgs.legacyPackages ? ${builtins.currentSystem}
     then
       inputs.nixpkgs.legacyPackages.${builtins.currentSystem}
     else
