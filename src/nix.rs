@@ -163,8 +163,7 @@ pub fn attr_to_nix_list(attr: &str) -> String {
 
 /// Generate the common Nix let-bindings for flake evaluation.
 ///
-/// Returns Nix code that sets up: flake, lock, inputs, outputs.
-/// Also includes the hasPath helper function.
+/// Returns Nix code that sets up: flake, lock, inputs, outputs, and helpers.
 pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
     let nix_dir = get_nix_dir()?;
     let lock_expr = get_lock_expr(flake_dir);
@@ -172,6 +171,9 @@ pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
 
     Ok(format!(
         r#"
+      helpers = import {nix_dir}/helpers.nix;
+      inherit (helpers) hasPath getPath resolveAttrPath;
+
       flake = import {flake_dir}/flake.nix;
       lock = {lock_expr};
       inputs = import {nix_dir}/inputs.nix {{
@@ -180,22 +182,6 @@ pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
         selfInfo = {self_info_expr};
       }};
       outputs = flake.outputs (inputs // {{ self = inputs.self // outputs; }});
-
-      # Check if a nested path exists in an attrset
-      hasPath = path: obj:
-        let
-          attempt = builtins.tryEval (
-            if path == [] then true
-            else if builtins.isAttrs obj && (obj ? ${{builtins.head path}})
-            then hasPath (builtins.tail path) obj.${{builtins.head path}}
-            else false
-          );
-        in
-          attempt.success && attempt.value;
-
-      # Get a value at a nested path
-      getPath = path: obj:
-        builtins.foldl' (o: k: o.${{k}}) obj path;
     "#,
         flake_dir = flake_dir.display(),
         lock_expr = lock_expr,
@@ -420,7 +406,9 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
         // Flake-based evaluation
         let flake_dir = flake_dir.context("flake_dir required for flake evaluation")?;
         let preamble = flake_eval_preamble(flake_dir)?;
-        let attr_list = attr_to_nix_list(attr);
+
+        // Handle empty attr (from .#) -> "default"
+        let effective_attr = if attr.is_empty() { "default" } else { attr };
 
         let apply_part = if let Some(ref apply_fn) = options.apply_fn {
             format!("({}) value", apply_fn)
@@ -432,34 +420,11 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
             r#"
         let
           {preamble}
-          userAttrPath = {attr_list};
-
-          # Empty attr means "default" (matching nix behavior: .# -> .#default)
-          effectiveAttrPath = if userAttrPath == [] then ["default"] else userAttrPath;
-
-          # Paths to try in order (matching nix eval behavior)
-          pathsToTry = [
-            (["packages" builtins.currentSystem] ++ effectiveAttrPath)
-            (["legacyPackages" builtins.currentSystem] ++ effectiveAttrPath)
-            effectiveAttrPath
-          ];
-
-          # Find the first valid path without crashing on the others
-          findFirstValid = paths:
-            if paths == [] then null
-            else if hasPath (builtins.head paths) outputs
-            then builtins.head paths
-            else findFirstValid (builtins.tail paths);
-
-          resultPath = findFirstValid pathsToTry;
-
-          value = if resultPath == null
-            then "No valid path found (or the flake is too broken to evaluate)"
-            else getPath resultPath outputs;
+          value = resolveAttrPath "{attr}" outputs;
         in {apply_part}
         "#,
             preamble = preamble,
-            attr_list = attr_list,
+            attr = effective_attr,
             apply_part = apply_part,
         )
     };

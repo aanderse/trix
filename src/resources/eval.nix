@@ -17,6 +17,9 @@ let
   flakePath = flakeDirPath + "/flake.nix";
   lockPath = flakeDirPath + "/flake.lock";
 
+  # Import shared helpers
+  helpers = import ./helpers.nix;
+
   # Read and parse the lock file
   lockExists = builtins.pathExists lockPath;
   lock =
@@ -52,26 +55,5 @@ let
   # Call outputs with inputs (recursive - self references outputs)
   outputs = flake.outputs inputs;
 
-  # Try to get an attribute path, with fallback from packages to legacyPackages
-  # This mirrors nix's behavior for .#attr references
-  getAttrPathWithFallback =
-    path: obj:
-    let
-      raw = builtins.split "\\." path;
-      parts = builtins.filter (x: builtins.isString x && x != "") raw;
-      firstPart = builtins.head parts;
-      restParts = builtins.tail parts;
-
-      # Check if path starts with "packages" and that category doesn't exist
-      needsFallback = firstPart == "packages" && !(obj ? packages) && obj ? legacyPackages;
-
-      # Build fallback path with legacyPackages instead of packages
-      fallbackParts = [ "legacyPackages" ] ++ restParts;
-    in
-    if needsFallback then
-      builtins.foldl' (o: k: o.${k}) obj fallbackParts
-    else
-      builtins.foldl' (o: k: o.${k}) obj parts;
-
 in
-getAttrPathWithFallback attr outputs
+helpers.resolveAttrPath attr outputs
