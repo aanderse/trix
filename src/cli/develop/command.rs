@@ -13,6 +13,18 @@ pub struct DevelopArgs {
     #[arg(short, long)]
     pub command: Option<String>,
 
+    /// Interpreter for shebang scripts (e.g., python3, bash)
+    #[arg(short = 'i', long = "interpreter")]
+    pub interpreter: Option<String>,
+
+    /// Script file to run with the interpreter (used in shebang mode)
+    #[arg(long = "script", hide = true)]
+    pub script: Option<String>,
+
+    /// Arguments to pass to the script (used in shebang mode)
+    #[arg(long = "script-args", hide = true, num_args = 0..)]
+    pub script_args: Vec<String>,
+
     /// Pass --arg NAME EXPR to nix
     #[arg(long = "arg", value_names = &["NAME", "EXPR"], num_args = 2)]
     pub extra_args: Vec<String>,
@@ -38,9 +50,39 @@ fn parse_arg_pairs(args: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Enter a development shell from flake.nix
+/// Build the command string for running an interpreter with a script.
+fn build_interpreter_command(interpreter: &str, script: &str, script_args: &[String]) -> String {
+    let mut parts = vec![interpreter.to_string(), script.to_string()];
+    parts.extend(script_args.iter().cloned());
+    // Quote arguments that contain spaces or special characters
+    parts
+        .iter()
+        .map(|arg| {
+            if arg.contains(' ') || arg.contains('\'') || arg.contains('"') {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Enter a development shell from flake.nix
 pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
+    // Determine the effective command to run
+    // If -i (interpreter) is specified with a script, build the command
+    let effective_command = if let Some(ref interpreter) = args.interpreter {
+        if let Some(ref script) = args.script {
+            Some(build_interpreter_command(interpreter, script, &args.script_args))
+        } else {
+            // -i without script: just use the interpreter as the command
+            Some(interpreter.clone())
+        }
+    } else {
+        args.command.clone()
+    };
+
     let resolved = resolve_installable(&args.installable);
 
     if !resolved.is_local {
@@ -51,7 +93,7 @@ pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
         let mut cmd = crate::command::NixCommand::new("nix");
         cmd.arg("develop").arg(&full_ref);
 
-        if let Some(c) = &args.command {
+        if let Some(c) = &effective_command {
             cmd.args(["--command", c]);
         }
 
@@ -83,7 +125,7 @@ pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
     let nix_config = crate::flake::get_nix_config(flake_dir, true);
 
     let options = ShellOptions {
-        command: args.command.clone(),
+        command: effective_command,
         extra_args: parse_arg_pairs(&args.extra_args),
         extra_argstrs: parse_arg_pairs(&args.extra_argstrs),
         store: args.store.clone(),

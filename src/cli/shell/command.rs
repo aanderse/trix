@@ -11,10 +11,53 @@ pub struct ShellArgs {
     /// Command to run in shell
     #[arg(short, long)]
     pub command: Option<String>,
+
+    /// Interpreter for shebang scripts (e.g., python3, bash)
+    #[arg(short = 'i', long = "interpreter")]
+    pub interpreter: Option<String>,
+
+    /// Script file to run with the interpreter (used in shebang mode)
+    #[arg(long = "script", hide = true)]
+    pub script: Option<String>,
+
+    /// Arguments to pass to the script (used in shebang mode)
+    #[arg(long = "script-args", hide = true, num_args = 0..)]
+    pub script_args: Vec<String>,
+}
+
+/// Build the command string for running an interpreter with a script.
+fn build_interpreter_command(interpreter: &str, script: &str, script_args: &[String]) -> String {
+    let mut parts = vec![interpreter.to_string(), script.to_string()];
+    parts.extend(script_args.iter().cloned());
+    // Quote arguments that contain spaces or special characters
+    parts
+        .iter()
+        .map(|arg| {
+            if arg.contains(' ') || arg.contains('\'') || arg.contains('"') {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Start a shell with specified packages available
 pub fn cmd_shell(args: ShellArgs) -> Result<()> {
+    // Determine the effective command to run
+    // If -i (interpreter) is specified with a script, build the command
+    let effective_command = if let Some(ref interpreter) = args.interpreter {
+        if let Some(ref script) = args.script {
+            Some(build_interpreter_command(interpreter, script, &args.script_args))
+        } else {
+            // -i without script: just use the interpreter as the command
+            Some(interpreter.clone())
+        }
+    } else {
+        args.command.clone()
+    };
+
     // Check if any installables are remote
     let mut has_remote = false;
     for installable in &args.installables {
@@ -31,7 +74,7 @@ pub fn cmd_shell(args: ShellArgs) -> Result<()> {
         cmd.args(["shell"]);
         cmd.args(&args.installables);
 
-        if let Some(c) = &args.command {
+        if let Some(c) = &effective_command {
             cmd.args(["--command", c]);
         }
 
@@ -83,7 +126,7 @@ pub fn cmd_shell(args: ShellArgs) -> Result<()> {
     let new_path = new_path_parts.join(":");
     env.insert("PATH".to_string(), new_path);
 
-    if let Some(cmd_str) = &args.command {
+    if let Some(cmd_str) = &effective_command {
         // Run command and exit
         let mut cmd = std::process::Command::new("sh");
         cmd.args(["-c", cmd_str]);

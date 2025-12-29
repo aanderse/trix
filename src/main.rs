@@ -15,6 +15,7 @@ mod lock;
 mod nix;
 mod profile;
 mod registry;
+mod shebang;
 
 /// trix - trick yourself into flakes
 #[derive(Parser)]
@@ -89,7 +90,35 @@ enum Commands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args().collect();
+
+    // Check for shebang mode before normal CLI parsing
+    let (cli, shebang_info) = if let Some(shebang_script) = shebang::detect_shebang(&args) {
+        // Build the argument list for shebang mode
+        let mut new_args = vec![args[0].clone()];
+
+        // Add global flags (like -v) first
+        new_args.extend(shebang_script.global_args.clone());
+
+        // Add the directive arguments
+        new_args.extend(shebang_script.args.clone());
+
+        // Add hidden arguments for script path and script arguments
+        new_args.push("--script".to_string());
+        new_args.push(shebang_script.script_path.clone());
+
+        // Add script arguments (everything after the script path in original args)
+        let script_args_start = shebang_script.script_index + 1;
+        if args.len() > script_args_start {
+            new_args.push("--script-args".to_string());
+            new_args.extend(args[script_args_start..].iter().cloned());
+        }
+
+        let cli = Cli::parse_from(&new_args);
+        (cli, Some(shebang_script))
+    } else {
+        (Cli::parse(), None)
+    };
 
     // Initialize tracing
     // Default to INFO unless verbose is set (then DEBUG), or RUST_LOG overrides it.
@@ -108,6 +137,10 @@ fn main() {
         .with_target(false) // cleaner output for simple CLI tools
         .with_writer(std::io::stderr)
         .init();
+
+    if shebang_info.is_some() {
+        tracing::debug!("Running in shebang mode");
+    }
 
     if let Err(e) = run(cli) {
         tracing::error!("Error: {:#}", e); // Use {:#} for alternate view (causal chain)
