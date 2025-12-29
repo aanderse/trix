@@ -117,10 +117,11 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
     let status = cmd
         .status()
         .context(format!("Failed to run {}", exe_path))?;
-    if status.success() {
-        Ok(())
-    } else {
+
+    if !status.success() {
         // Exit silently with the same code - the application already printed its error
         std::process::exit(status.code().unwrap_or(1))
     }
+
+    Ok(())
 }
