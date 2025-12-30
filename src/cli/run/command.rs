@@ -40,7 +40,6 @@ fn parse_arg_pairs(args: &[String]) -> Vec<(String, String)> {
 }
 
 /// Build and run a package from flake.nix
-/// Build and run a package from flake.nix
 pub fn cmd_run(args: RunArgs) -> Result<()> {
     let resolved = resolve_installable(&args.installable);
 

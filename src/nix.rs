@@ -161,31 +161,36 @@ pub fn attr_to_nix_list(attr: &str) -> String {
     format!("[{}]", quoted.join(" "))
 }
 
-/// Generate the common Nix let-bindings for flake evaluation.
+/// Generate the common Nix let-bindings for evaluation.
 ///
-/// Returns Nix code that sets up: flake, lock, inputs, outputs, and helpers.
-pub fn flake_eval_preamble(flake_dir: &Path) -> Result<String> {
+/// Returns Nix code that sets up the environment (helpers, outputs, etc.) for
+/// either a flake (via flake.nix) or a legacy project (via default.nix).
+pub fn get_eval_preamble(flake_dir: &Path) -> Result<String> {
     let nix_dir = get_nix_dir()?;
-    let lock_expr = get_lock_expr(flake_dir);
-    let self_info_expr = get_self_info_expr(flake_dir);
+    let is_flake = flake_dir.join("flake.nix").exists();
+
+    let (lock_expr, self_info_expr) = if is_flake {
+        (get_lock_expr(flake_dir), get_self_info_expr(flake_dir))
+    } else {
+        // Legacy mode: no flake.nix means no lock or self input metadata.
+        ("{}".to_string(), "{}".to_string())
+    };
 
     Ok(format!(
         r#"
-      helpers = import {nix_dir}/helpers.nix;
-      inherit (helpers) hasPath getPath resolveAttrPath;
-
-      flake = import {flake_dir}/flake.nix;
-      lock = {lock_expr};
-      inputs = import {nix_dir}/inputs.nix {{
-        inherit lock;
-        flakeDirPath = {flake_dir};
+      context = import {nix_dir}/get_eval_preamble.nix {{
+        flakeDir = {flake_dir};
+        isFlake = {is_flake};
+        lock = {lock_expr};
         selfInfo = {self_info_expr};
+        nixDir = {nix_dir};
       }};
-      outputs = flake.outputs (inputs // {{ self = inputs.self // outputs; }});
+      inherit (context) helpers hasPath getPath resolveAttrPath outputs;
     "#,
-        flake_dir = flake_dir.display(),
-        lock_expr = lock_expr,
         nix_dir = nix_dir.display(),
+        flake_dir = flake_dir.display(),
+        is_flake = is_flake,
+        lock_expr = lock_expr,
         self_info_expr = self_info_expr,
     ))
 }
@@ -269,14 +274,21 @@ pub fn run_nix_build(
     options: &BuildOptions,
     capture_output: bool,
 ) -> Result<Option<String>> {
-    let nix_dir = get_nix_dir()?;
-    let self_info_expr = get_self_info_expr(flake_dir);
-
     let mut cmd = crate::command::NixCommand::new("nix-build");
-    cmd.arg(nix_dir.join("eval.nix"));
-    cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
-    cmd.args(["--arg", "selfInfo", &self_info_expr]);
-    cmd.args(["--argstr", "attr", attr]);
+
+    if flake_dir.join("flake.nix").exists() {
+        let nix_dir = get_nix_dir()?;
+        let self_info_expr = get_self_info_expr(flake_dir);
+
+        cmd.arg(nix_dir.join("eval.nix"));
+        cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+        cmd.args(["--arg", "selfInfo", &self_info_expr]);
+        cmd.args(["--argstr", "attr", attr]);
+    } else {
+        // Legacy mode: use standard nix-build with attribute path.
+        cmd.arg(flake_dir);
+        cmd.args(["-A", attr]);
+    }
 
     if let Some(ref store) = options.store {
         cmd.args(["--store", store]);
@@ -405,7 +417,7 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
     } else {
         // Flake-based evaluation
         let flake_dir = flake_dir.context("flake_dir required for flake evaluation")?;
-        let preamble = flake_eval_preamble(flake_dir)?;
+        let preamble = get_eval_preamble(flake_dir)?;
 
         // Handle empty attr (from .#) -> "default"
         let effective_attr = if attr.is_empty() { "default" } else { attr };
@@ -504,7 +516,7 @@ fn unescape_nix_string(s: &str) -> String {
 
 /// Check if a flake has a specific attribute path.
 pub fn flake_has_attr(flake_dir: &Path, attr: &str) -> Result<bool> {
-    let preamble = flake_eval_preamble(flake_dir)?;
+    let preamble = get_eval_preamble(flake_dir)?;
     let attr_list = attr_to_nix_list(attr);
 
     let nix_expr = format!(
@@ -527,10 +539,13 @@ pub fn flake_has_attr(flake_dir: &Path, attr: &str) -> Result<bool> {
     }
 }
 
-/// Get the main program name for a package (for `trix run`).
-/// Checks meta.mainProgram, then pname, then name (with version stripped).
+/// Get the main program name for a package.
+///
+/// Determines the executable name by inspecting the package's metadata
+/// (meta.mainProgram, pname, or name).
 pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> {
-    let preamble = flake_eval_preamble(flake_dir)?;
+    let nix_dir = get_nix_dir()?;
+    let preamble = get_eval_preamble(flake_dir)?;
 
     // Evaluate the package to get mainProgram, pname, or name
     // Uses resolveAttrPath from helpers.nix for packages -> legacyPackages fallback
@@ -538,25 +553,13 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
         r#"
     let
       {preamble}
-
-      pkg = resolveAttrPath "{attr}" outputs;
-      # Get mainProgram from meta, or fall back to pname/name
-      mainProgram = pkg.meta.mainProgram or null;
-      pname = pkg.pname or null;
-      # Strip version from name (e.g., "hello-2.10" -> "hello")
-      name = pkg.name or null;
-      nameWithoutVersion =
-        if name == null then null
-        else let
-          parts = builtins.match "(.+)-[0-9].*" name;
-        in if parts == null then name else builtins.head parts;
-    in
-      if mainProgram != null then mainProgram
-      else if pname != null then pname
-      else if nameWithoutVersion != null then nameWithoutVersion
-      else null
+    in import {nix_dir}/get_package_main_program.nix {{
+      inherit outputs resolveAttrPath;
+      attr = "{attr}";
+    }}
     "#,
         preamble = preamble,
+        nix_dir = nix_dir.display(),
         attr = attr,
     );
 
@@ -661,7 +664,7 @@ pub fn eval_flake_output_category(
     all_systems: bool,
     show_legacy: bool,
 ) -> Result<Option<serde_json::Value>> {
-    let preamble = flake_eval_preamble(flake_dir)?;
+    let preamble = get_eval_preamble(flake_dir)?;
     let all_systems_nix = if all_systems { "true" } else { "false" };
     let show_legacy_nix = if show_legacy { "true" } else { "false" };
 
@@ -702,7 +705,7 @@ pub fn eval_flake_output_category(
 
 /// Get the list of top-level output category names.
 pub fn get_flake_output_categories(flake_dir: &Path) -> Result<Option<Vec<String>>> {
-    let preamble = flake_eval_preamble(flake_dir)?;
+    let preamble = get_eval_preamble(flake_dir)?;
 
     let expr = format!(
         r#"
