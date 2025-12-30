@@ -57,60 +57,18 @@ pub fn cmd_fmt(args: FmtArgs) -> Result<()> {
 
     let flake_dir = resolved.flake_dir.as_ref().context("No flake directory")?;
 
-    let exe_path = if flake_dir.join("flake.nix").exists() {
-        // Build the formatter first to ensure the store path exists
-        let build_options = BuildOptions {
-            out_link: None,
-            store: args.store.clone(),
-            ..Default::default()
-        };
-
-        let store_path = build_resolved_attribute(&resolved, &attr, &build_options, true)?
-            .context("Build failed")?;
-
-        let main_program = get_package_main_program(flake_dir, &attr)?;
-        format!("{}/bin/{}", store_path, main_program)
-    } else {
-        // Fallback for non-flake projects (legacy)
-        tracing::debug!("No flake.nix found, trying legacy nix-build");
-
-        // For legacy, we just use standard nix-build
-        // If attr starts with "formatter.", we use it as is
-        // We assume we are in the directory we want to build
-        let mut cmd = crate::command::NixCommand::new("nix-build");
-        cmd.arg(&flake_dir);
-        cmd.args(["-A", &attr]);
-        cmd.arg("--no-out-link");
-
-        if let Some(s) = &args.store {
-            cmd.args(["--store", s]);
-        }
-
-        let output = cmd.output()?;
-        let store_path = output.trim().lines().last().unwrap_or("").to_string();
-
-        if store_path.is_empty() {
-            anyhow::bail!("Build failed or produced no output");
-        }
-
-        // Try to find mainProgram via nix-instantiate
-        // Handle if default.nix is a function (call with {}) or a set
-        let expr = format!(
-            "let root = import {}; in (if builtins.isFunction root then root {{}} else root).{}.meta.mainProgram or null",
-            flake_dir.display(),
-            attr
-        );
-        let mut eval_cmd = crate::command::NixCommand::new("nix-instantiate");
-        eval_cmd.args(["--eval", "--json", "--expr", &expr]);
-
-        let main_program: Option<String> = eval_cmd.json().ok().flatten();
-
-        if let Some(prog) = main_program {
-            format!("{}/bin/{}", store_path, prog)
-        } else {
-            anyhow::bail!("Could not determine executable path")
-        }
+    // Build the formatter
+    let build_options = BuildOptions {
+        out_link: None,
+        store: args.store.clone(),
+        ..Default::default()
     };
+
+    let store_path = build_resolved_attribute(&resolved, &attr, &build_options, true)?
+        .context("Build failed")?;
+
+    let main_program = get_package_main_program(flake_dir, &attr)?;
+    let exe_path = format!("{}/bin/{}", store_path, main_program);
 
     // Run the executable
     let mut cmd = std::process::Command::new(&exe_path);
