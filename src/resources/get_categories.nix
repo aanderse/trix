@@ -1,0 +1,3 @@
+{ outputs }:
+
+builtins.attrNames outputs

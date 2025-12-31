@@ -1,4 +1,4 @@
-use crate::flake::{ensure_lock, resolve_installable};
+use crate::flake::resolve_installable;
 use crate::nix::run_nix_repl;
 use anyhow::{Context, Result};
 use clap::Args;
@@ -34,14 +34,6 @@ pub fn cmd_repl(args: ReplArgs) -> Result<()> {
     }
 
     let flake_dir = resolved.flake_dir.as_ref().context("No flake directory")?;
-
-    // Check that flake.nix exists (matches Python behavior)
-    if !flake_dir.join("flake.nix").exists() {
-        anyhow::bail!("No flake.nix found in {}", flake_dir.display());
-    }
-
-    // Ensure lock exists
-    ensure_lock(flake_dir, None)?;
 
     run_nix_repl(flake_dir)
 }

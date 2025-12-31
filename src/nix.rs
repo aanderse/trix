@@ -113,38 +113,13 @@ pub fn get_lock_expr(flake_dir: &Path) -> String {
 pub fn get_self_info_expr(flake_dir: &Path) -> String {
     let git_info = crate::git::get_git_info(flake_dir).unwrap_or_default();
 
-    // Construct selfInfo attrset
-    let mut parts = Vec::new();
+    // Serialize to JSON
+    let json = serde_json::to_string(&git_info).unwrap_or_else(|_| "{}".to_string());
 
-    // Clean repo attributes
-    if let Some(rev) = git_info.rev {
-        parts.push(format!("rev = \"{}\";", rev));
-    }
-    if let Some(short_rev) = git_info.short_rev {
-        parts.push(format!("shortRev = \"{}\";", short_rev));
-    }
+    // Quote the JSON string for use in Nix expression: "..."
+    let quoted_json = serde_json::to_string(&json).unwrap_or_else(|_| "\" {}\"".to_string());
 
-    // Dirty repo attributes
-    if let Some(dirty_rev) = git_info.dirty_rev {
-        parts.push(format!("dirtyRev = \"{}\";", dirty_rev));
-    }
-    if let Some(dirty_short_rev) = git_info.dirty_short_rev {
-        parts.push(format!("dirtyShortRev = \"{}\";", dirty_short_rev));
-    }
-
-    // Always included attributes
-    if let Some(last_modified) = git_info.last_modified {
-        parts.push(format!("lastModified = {};", last_modified));
-    }
-    if let Some(date) = git_info.last_modified_date {
-        parts.push(format!("lastModifiedDate = \"{}\";", date));
-    }
-    parts.push(format!(
-        "submodules = {};",
-        if git_info.submodules { "true" } else { "false" }
-    ));
-
-    format!("{{ {} }}", parts.join(" "))
+    format!("builtins.fromJSON {}", quoted_json)
 }
 
 /// Convert a dotted attribute path to a Nix list expression.
@@ -256,6 +231,28 @@ pub fn get_store_dir() -> Result<String> {
     Ok(store_dir)
 }
 
+/// Options shared across nix commands
+pub trait CommonNixOptions {
+    fn store(&self) -> Option<&str>;
+    fn extra_args(&self) -> &[(String, String)];
+    fn extra_argstrs(&self) -> &[(String, String)];
+}
+
+/// Helper to apply common arguments to a Nix command
+fn apply_common_args<T: CommonNixOptions>(cmd: &mut crate::command::NixCommand, options: &T) {
+    if let Some(store) = options.store() {
+        cmd.args(["--store", store]);
+    }
+
+    for (name, expr) in options.extra_args() {
+        cmd.args(["--arg", name, expr]);
+    }
+
+    for (name, value) in options.extra_argstrs() {
+        cmd.args(["--argstr", name, value]);
+    }
+}
+
 /// Options for nix-build
 #[derive(Debug, Default)]
 pub struct BuildOptions {
@@ -263,6 +260,18 @@ pub struct BuildOptions {
     pub extra_args: Vec<(String, String)>,
     pub extra_argstrs: Vec<(String, String)>,
     pub store: Option<String>,
+}
+
+impl CommonNixOptions for BuildOptions {
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref()
+    }
+    fn extra_args(&self) -> &[(String, String)] {
+        &self.extra_args
+    }
+    fn extra_argstrs(&self) -> &[(String, String)] {
+        &self.extra_argstrs
+    }
 }
 
 /// Run nix-build with eval.nix wrapper.
@@ -290,17 +299,7 @@ pub fn run_nix_build(
         cmd.args(["-A", attr]);
     }
 
-    if let Some(ref store) = options.store {
-        cmd.args(["--store", store]);
-    }
-
-    for (name, expr) in &options.extra_args {
-        cmd.args(["--arg", name, expr]);
-    }
-
-    for (name, value) in &options.extra_argstrs {
-        cmd.args(["--argstr", name, value]);
-    }
+    apply_common_args(&mut cmd, options);
 
     match &options.out_link {
         Some(link) => {
@@ -331,6 +330,18 @@ pub struct ShellOptions {
     pub bash_prompt_suffix: Option<String>,
 }
 
+impl CommonNixOptions for ShellOptions {
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref()
+    }
+    fn extra_args(&self) -> &[(String, String)] {
+        &self.extra_args
+    }
+    fn extra_argstrs(&self) -> &[(String, String)] {
+        &self.extra_argstrs
+    }
+}
+
 /// Run nix-shell with eval.nix wrapper. Replaces current process.
 pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Result<()> {
     let nix_dir = get_nix_dir()?;
@@ -342,17 +353,7 @@ pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Re
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
     cmd.args(["--argstr", "attr", attr]);
 
-    if let Some(ref store) = options.store {
-        cmd.args(["--store", store]);
-    }
-
-    for (name, expr) in &options.extra_args {
-        cmd.args(["--arg", name, expr]);
-    }
-
-    for (name, value) in &options.extra_argstrs {
-        cmd.args(["--argstr", name, value]);
-    }
+    apply_common_args(&mut cmd, options);
 
     if let Some(ref command) = options.command {
         cmd.args(["--command", command]);
@@ -405,6 +406,18 @@ pub struct EvalOptions {
     pub quiet: bool,
 }
 
+impl CommonNixOptions for EvalOptions {
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref()
+    }
+    fn extra_args(&self) -> &[(String, String)] {
+        &self.extra_args
+    }
+    fn extra_argstrs(&self) -> &[(String, String)] {
+        &self.extra_argstrs
+    }
+}
+
 /// Evaluate a flake attribute or raw expression and return the result.
 pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions) -> Result<String> {
     let nix_expr = if let Some(ref expr) = options.expr {
@@ -422,22 +435,28 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
         // Handle empty attr (from .#) -> "default"
         let effective_attr = if attr.is_empty() { "default" } else { attr };
 
-        let apply_part = if let Some(ref apply_fn) = options.apply_fn {
-            format!("({}) value", apply_fn)
-        } else {
-            "value".to_string()
-        };
+        // We will pass applyFn via command line args if it exists, so we don't interpolate it here.
+        // But wait, run_nix_eval builds the expression string.
+        // It uses `nix-instantiate --expr`.
+        // If I want to use `eval_attr.nix`, I do:
+        // import {nix_dir}/eval_attr.nix { inherit outputs resolveAttrPath; attr = "{attr}"; applyFn = {apply_fn_or_null}; }
+
+        let apply_fn_arg = options.apply_fn.as_deref().unwrap_or("id: id");
 
         format!(
             r#"
         let
           {preamble}
-          value = resolveAttrPath "{attr}" outputs;
-        in {apply_part}
+        in import {nix_dir}/eval_attr.nix {{
+          inherit outputs resolveAttrPath;
+          attr = "{attr}";
+          applyFn = {apply_fn};
+        }}
         "#,
             preamble = preamble,
+            nix_dir = get_nix_dir()?.display(),
             attr = effective_attr,
-            apply_part = apply_part,
+            apply_fn = apply_fn_arg,
         )
     };
 
@@ -450,20 +469,10 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
         &nix_expr,
     ]);
 
-    if let Some(ref store) = options.store {
-        cmd.args(["--store", store]);
-    }
+    apply_common_args(&mut cmd, options);
 
     if options.output_json {
         cmd.arg("--json");
-    }
-
-    for (name, expr) in &options.extra_args {
-        cmd.args(["--arg", name, expr]);
-    }
-
-    for (name, value) in &options.extra_argstrs {
-        cmd.args(["--argstr", name, value]);
     }
 
     match cmd.output() {
@@ -574,13 +583,25 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
 /// Run nix repl with flake context loaded. Replaces current process.
 pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
     let nix_dir = get_nix_dir()?;
-    let self_info_expr = get_self_info_expr(flake_dir);
+    let is_flake = flake_dir.join("flake.nix").exists();
+    let self_info_expr = if is_flake {
+        get_self_info_expr(flake_dir)
+    } else {
+        "{}".to_string()
+    };
+    let lock_expr = if is_flake {
+        get_lock_expr(flake_dir)
+    } else {
+        "{}".to_string() // Empty lock for legacy
+    };
 
     let mut cmd = crate::command::NixCommand::new("nix");
     cmd.args(["repl", "--file"]);
     cmd.arg(nix_dir.join("repl.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+    cmd.args(["--arg", "isFlake", if is_flake { "true" } else { "false" }]);
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
+    cmd.args(["--arg", "lock", &lock_expr]);
 
     cmd.exec()
 }
@@ -707,13 +728,17 @@ pub fn eval_flake_output_category(
 pub fn get_flake_output_categories(flake_dir: &Path) -> Result<Option<Vec<String>>> {
     let preamble = get_eval_preamble(flake_dir)?;
 
+    let nix_dir = get_nix_dir()?;
     let expr = format!(
         r#"
     let
       {preamble}
-    in builtins.attrNames outputs
+    in import {nix_dir}/get_categories.nix {{
+      inherit outputs;
+    }}
     "#,
         preamble = preamble,
+        nix_dir = nix_dir.display(),
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
