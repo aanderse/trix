@@ -22,19 +22,28 @@ static GIT_INFO_CACHE: Lazy<Mutex<HashMap<PathBuf, GitInfo>>> =
 /// per-commit in ~/.cache/nix/fetcher-cache-v4.sqlite, but we don't want to
 /// maintain a separate cache. Most flakes don't use revCount anyway, and Nix
 /// itself is moving toward not computing it by default for local repos.
-#[derive(Debug, Clone, Default)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GitInfo {
     /// Full commit hash (only when clean)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rev: Option<String>,
     /// Short commit hash (only when clean)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub short_rev: Option<String>,
     /// Full commit hash with "-dirty" suffix (only when dirty)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dirty_rev: Option<String>,
     /// Short commit hash with "-dirty" suffix (only when dirty)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dirty_short_rev: Option<String>,
     /// Unix timestamp of last commit
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<i64>,
     /// Formatted date string YYYYMMDDHHMMSS
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_modified_date: Option<String>,
     /// Whether the repository has submodules
     pub submodules: bool,

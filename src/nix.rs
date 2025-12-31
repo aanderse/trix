@@ -113,38 +113,13 @@ pub fn get_lock_expr(flake_dir: &Path) -> String {
 pub fn get_self_info_expr(flake_dir: &Path) -> String {
     let git_info = crate::git::get_git_info(flake_dir).unwrap_or_default();
 
-    // Construct selfInfo attrset
-    let mut parts = Vec::new();
+    // Serialize to JSON
+    let json = serde_json::to_string(&git_info).unwrap_or_else(|_| "{}".to_string());
 
-    // Clean repo attributes
-    if let Some(rev) = git_info.rev {
-        parts.push(format!("rev = \"{}\";", rev));
-    }
-    if let Some(short_rev) = git_info.short_rev {
-        parts.push(format!("shortRev = \"{}\";", short_rev));
-    }
+    // Quote the JSON string for use in Nix expression: "..."
+    let quoted_json = serde_json::to_string(&json).unwrap_or_else(|_| "\" {}\"".to_string());
 
-    // Dirty repo attributes
-    if let Some(dirty_rev) = git_info.dirty_rev {
-        parts.push(format!("dirtyRev = \"{}\";", dirty_rev));
-    }
-    if let Some(dirty_short_rev) = git_info.dirty_short_rev {
-        parts.push(format!("dirtyShortRev = \"{}\";", dirty_short_rev));
-    }
-
-    // Always included attributes
-    if let Some(last_modified) = git_info.last_modified {
-        parts.push(format!("lastModified = {};", last_modified));
-    }
-    if let Some(date) = git_info.last_modified_date {
-        parts.push(format!("lastModifiedDate = \"{}\";", date));
-    }
-    parts.push(format!(
-        "submodules = {};",
-        if git_info.submodules { "true" } else { "false" }
-    ));
-
-    format!("{{ {} }}", parts.join(" "))
+    format!("builtins.fromJSON {}", quoted_json)
 }
 
 /// Convert a dotted attribute path to a Nix list expression.
