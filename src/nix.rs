@@ -555,13 +555,25 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
 /// Run nix repl with flake context loaded. Replaces current process.
 pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
     let nix_dir = get_nix_dir()?;
-    let self_info_expr = get_self_info_expr(flake_dir);
+    let is_flake = flake_dir.join("flake.nix").exists();
+    let self_info_expr = if is_flake {
+        get_self_info_expr(flake_dir)
+    } else {
+        "{}".to_string()
+    };
+    let lock_expr = if is_flake {
+        get_lock_expr(flake_dir)
+    } else {
+        "{}".to_string() // Empty lock for legacy
+    };
 
     let mut cmd = crate::command::NixCommand::new("nix");
     cmd.args(["repl", "--file"]);
     cmd.arg(nix_dir.join("repl.nix"));
     cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+    cmd.args(["--arg", "isFlake", if is_flake { "true" } else { "false" }]);
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
+    cmd.args(["--arg", "lock", &lock_expr]);
 
     cmd.exec()
 }
