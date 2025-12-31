@@ -397,22 +397,28 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
         // Handle empty attr (from .#) -> "default"
         let effective_attr = if attr.is_empty() { "default" } else { attr };
 
-        let apply_part = if let Some(ref apply_fn) = options.apply_fn {
-            format!("({}) value", apply_fn)
-        } else {
-            "value".to_string()
-        };
+        // We will pass applyFn via command line args if it exists, so we don't interpolate it here.
+        // But wait, run_nix_eval builds the expression string.
+        // It uses `nix-instantiate --expr`.
+        // If I want to use `eval_attr.nix`, I do:
+        // import {nix_dir}/eval_attr.nix { inherit outputs resolveAttrPath; attr = "{attr}"; applyFn = {apply_fn_or_null}; }
+
+        let apply_fn_arg = options.apply_fn.as_deref().unwrap_or("id: id");
 
         format!(
             r#"
         let
           {preamble}
-          value = resolveAttrPath "{attr}" outputs;
-        in {apply_part}
+        in import {nix_dir}/eval_attr.nix {{
+          inherit outputs resolveAttrPath;
+          attr = "{attr}";
+          applyFn = {apply_fn};
+        }}
         "#,
             preamble = preamble,
+            nix_dir = get_nix_dir()?.display(),
             attr = effective_attr,
-            apply_part = apply_part,
+            apply_fn = apply_fn_arg,
         )
     };
 
@@ -682,13 +688,17 @@ pub fn eval_flake_output_category(
 pub fn get_flake_output_categories(flake_dir: &Path) -> Result<Option<Vec<String>>> {
     let preamble = get_eval_preamble(flake_dir)?;
 
+    let nix_dir = get_nix_dir()?;
     let expr = format!(
         r#"
     let
       {preamble}
-    in builtins.attrNames outputs
+    in import {nix_dir}/get_categories.nix {{
+      inherit outputs;
+    }}
     "#,
         preamble = preamble,
+        nix_dir = nix_dir.display(),
     );
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
