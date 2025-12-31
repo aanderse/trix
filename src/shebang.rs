@@ -147,11 +147,7 @@ fn parse_shebang_directives(path: &Path) -> Option<Vec<String>> {
             Some(rest)
         } else if let Some(rest) = trimmed.strip_prefix("# !trix") {
             Some(rest)
-        } else if let Some(rest) = trimmed.strip_prefix("# ! trix") {
-            Some(rest)
-        } else {
-            None
-        };
+        } else { trimmed.strip_prefix("# ! trix") };
 
         if let Some(rest) = directive {
             // Parse the rest of the line as shell-like arguments
