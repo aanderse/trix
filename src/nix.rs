@@ -231,6 +231,28 @@ pub fn get_store_dir() -> Result<String> {
     Ok(store_dir)
 }
 
+/// Options shared across nix commands
+pub trait CommonNixOptions {
+    fn store(&self) -> Option<&str>;
+    fn extra_args(&self) -> &[(String, String)];
+    fn extra_argstrs(&self) -> &[(String, String)];
+}
+
+/// Helper to apply common arguments to a Nix command
+fn apply_common_args<T: CommonNixOptions>(cmd: &mut crate::command::NixCommand, options: &T) {
+    if let Some(store) = options.store() {
+        cmd.args(["--store", store]);
+    }
+
+    for (name, expr) in options.extra_args() {
+        cmd.args(["--arg", name, expr]);
+    }
+
+    for (name, value) in options.extra_argstrs() {
+        cmd.args(["--argstr", name, value]);
+    }
+}
+
 /// Options for nix-build
 #[derive(Debug, Default)]
 pub struct BuildOptions {
@@ -238,6 +260,18 @@ pub struct BuildOptions {
     pub extra_args: Vec<(String, String)>,
     pub extra_argstrs: Vec<(String, String)>,
     pub store: Option<String>,
+}
+
+impl CommonNixOptions for BuildOptions {
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref()
+    }
+    fn extra_args(&self) -> &[(String, String)] {
+        &self.extra_args
+    }
+    fn extra_argstrs(&self) -> &[(String, String)] {
+        &self.extra_argstrs
+    }
 }
 
 /// Run nix-build with eval.nix wrapper.
@@ -265,17 +299,7 @@ pub fn run_nix_build(
         cmd.args(["-A", attr]);
     }
 
-    if let Some(ref store) = options.store {
-        cmd.args(["--store", store]);
-    }
-
-    for (name, expr) in &options.extra_args {
-        cmd.args(["--arg", name, expr]);
-    }
-
-    for (name, value) in &options.extra_argstrs {
-        cmd.args(["--argstr", name, value]);
-    }
+    apply_common_args(&mut cmd, options);
 
     match &options.out_link {
         Some(link) => {
@@ -306,6 +330,18 @@ pub struct ShellOptions {
     pub bash_prompt_suffix: Option<String>,
 }
 
+impl CommonNixOptions for ShellOptions {
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref()
+    }
+    fn extra_args(&self) -> &[(String, String)] {
+        &self.extra_args
+    }
+    fn extra_argstrs(&self) -> &[(String, String)] {
+        &self.extra_argstrs
+    }
+}
+
 /// Run nix-shell with eval.nix wrapper. Replaces current process.
 pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Result<()> {
     let nix_dir = get_nix_dir()?;
@@ -317,17 +353,7 @@ pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Re
     cmd.args(["--arg", "selfInfo", &self_info_expr]);
     cmd.args(["--argstr", "attr", attr]);
 
-    if let Some(ref store) = options.store {
-        cmd.args(["--store", store]);
-    }
-
-    for (name, expr) in &options.extra_args {
-        cmd.args(["--arg", name, expr]);
-    }
-
-    for (name, value) in &options.extra_argstrs {
-        cmd.args(["--argstr", name, value]);
-    }
+    apply_common_args(&mut cmd, options);
 
     if let Some(ref command) = options.command {
         cmd.args(["--command", command]);
@@ -378,6 +404,18 @@ pub struct EvalOptions {
     pub expr: Option<String>,
     pub store: Option<String>,
     pub quiet: bool,
+}
+
+impl CommonNixOptions for EvalOptions {
+    fn store(&self) -> Option<&str> {
+        self.store.as_deref()
+    }
+    fn extra_args(&self) -> &[(String, String)] {
+        &self.extra_args
+    }
+    fn extra_argstrs(&self) -> &[(String, String)] {
+        &self.extra_argstrs
+    }
 }
 
 /// Evaluate a flake attribute or raw expression and return the result.
@@ -431,20 +469,10 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
         &nix_expr,
     ]);
 
-    if let Some(ref store) = options.store {
-        cmd.args(["--store", store]);
-    }
+    apply_common_args(&mut cmd, options);
 
     if options.output_json {
         cmd.arg("--json");
-    }
-
-    for (name, expr) in &options.extra_args {
-        cmd.args(["--arg", name, expr]);
-    }
-
-    for (name, value) in &options.extra_argstrs {
-        cmd.args(["--argstr", name, value]);
     }
 
     match cmd.output() {
