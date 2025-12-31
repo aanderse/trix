@@ -9,6 +9,7 @@ use clap_complete::{generate, Shell};
 
 mod cli;
 mod command;
+mod common;
 mod flake;
 mod git;
 mod lock;

@@ -1,13 +1,10 @@
 use anyhow::{Context, Result};
 use git2::{Repository, StatusOptions};
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use crate::common::Cache;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// Cache for git info per directory (canonical path -> GitInfo)
-static GIT_INFO_CACHE: Lazy<Mutex<HashMap<PathBuf, GitInfo>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static GIT_INFO_CACHE: Cache<PathBuf, GitInfo> = Cache::new();
 
 /// Git metadata for an input.
 ///
@@ -59,12 +56,9 @@ pub fn get_git_info(path: &Path) -> Result<GitInfo> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     // Check cache first
-    {
-        let cache = GIT_INFO_CACHE.lock().unwrap();
-        if let Some(info) = cache.get(&canonical) {
-            tracing::debug!("get_git_info: cache hit");
-            return Ok(info.clone());
-        }
+    if let Some(info) = GIT_INFO_CACHE.get(&canonical) {
+        tracing::debug!("get_git_info: cache hit");
+        return Ok(info);
     }
 
     tracing::debug!("get_git_info: cache miss, computing...");
@@ -122,10 +116,7 @@ pub fn get_git_info(path: &Path) -> Result<GitInfo> {
     info.submodules = has_submodules(&repo);
 
     // Cache the result
-    {
-        let mut cache = GIT_INFO_CACHE.lock().unwrap();
-        cache.insert(canonical, info.clone());
-    }
+    GIT_INFO_CACHE.insert(canonical, info.clone());
 
     Ok(info)
 }

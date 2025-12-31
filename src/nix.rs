@@ -3,26 +3,25 @@
 //! This module provides functions to run nix commands (nix-build, nix-shell, nix-instantiate)
 //! with the trix evaluation wrapper.
 
+use crate::common::Memoized;
 use anyhow::{Context, Result};
-use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// Empty lock expression for flakes without a lock file
 pub const EMPTY_LOCK_EXPR: &str =
     r#"{ nodes = { root = { inputs = {}; }; }; root = "root"; version = 7; }"#;
 
 /// Cached nix dir path
-static NIX_DIR_CACHE: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
+static NIX_DIR_CACHE: Memoized<PathBuf> = Memoized::new();
 
 /// Cached system value
-static SYSTEM_CACHE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+static SYSTEM_CACHE: Memoized<String> = Memoized::new();
 
 /// Cached store dir value
-static STORE_DIR_CACHE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+static STORE_DIR_CACHE: Memoized<String> = Memoized::new();
 
 /// Get environment suitable for spawning nix commands.
 ///
@@ -47,20 +46,14 @@ pub fn warn(msg: &str) {
 /// - Installed: share/trix/nix/ (from bin/trix)
 pub fn get_nix_dir() -> Result<PathBuf> {
     // Check cache first
-    {
-        let cache = NIX_DIR_CACHE.lock().unwrap();
-        if let Some(ref dir) = *cache {
-            return Ok(dir.clone());
-        }
+    if let Some(dir) = NIX_DIR_CACHE.get() {
+        return Ok(dir);
     }
 
     let nix_dir = find_nix_dir()?;
 
     // Cache the result
-    {
-        let mut cache = NIX_DIR_CACHE.lock().unwrap();
-        *cache = Some(nix_dir.clone());
-    }
+    NIX_DIR_CACHE.set(nix_dir.clone());
 
     Ok(nix_dir)
 }
@@ -173,11 +166,8 @@ pub fn get_eval_preamble(flake_dir: &Path) -> Result<String> {
 /// Get the current Nix system (e.g., x86_64-linux). Result is cached.
 pub fn get_system() -> Result<String> {
     // Check cache first
-    {
-        let cache = SYSTEM_CACHE.lock().unwrap();
-        if let Some(ref system) = *cache {
-            return Ok(system.clone());
-        }
+    if let Some(system) = SYSTEM_CACHE.get() {
+        return Ok(system);
     }
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
@@ -186,10 +176,7 @@ pub fn get_system() -> Result<String> {
     let system = cmd.json().unwrap_or_else(|_| get_fallback_system());
 
     // Cache the result
-    {
-        let mut cache = SYSTEM_CACHE.lock().unwrap();
-        *cache = Some(system.clone());
-    }
+    SYSTEM_CACHE.set(system.clone());
 
     Ok(system)
 }
@@ -210,11 +197,8 @@ fn get_fallback_system() -> String {
 /// Get the Nix store directory (e.g., /nix/store). Result is cached.
 pub fn get_store_dir() -> Result<String> {
     // Check cache first
-    {
-        let cache = STORE_DIR_CACHE.lock().unwrap();
-        if let Some(ref store_dir) = *cache {
-            return Ok(store_dir.clone());
-        }
+    if let Some(store_dir) = STORE_DIR_CACHE.get() {
+        return Ok(store_dir);
     }
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
@@ -223,10 +207,7 @@ pub fn get_store_dir() -> Result<String> {
     let store_dir = cmd.json().unwrap_or_else(|_| "/nix/store".to_string());
 
     // Cache the result
-    {
-        let mut cache = STORE_DIR_CACHE.lock().unwrap();
-        *cache = Some(store_dir.clone());
-    }
+    STORE_DIR_CACHE.set(store_dir.clone());
 
     Ok(store_dir)
 }
