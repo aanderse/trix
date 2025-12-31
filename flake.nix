@@ -23,13 +23,10 @@
         );
     in
     {
-      packages = forAllSystems (
-        pkgs:
-        {
-          inherit (pkgs) trix;
-          default = pkgs.trix;
-        }
-      );
+      packages = forAllSystems (pkgs: {
+        inherit (pkgs) trix;
+        default = pkgs.trix;
+      });
 
       formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
 
