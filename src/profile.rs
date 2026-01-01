@@ -287,7 +287,7 @@ pub fn install(
 
             // Check if it's a store path (already built derivation)
             // But only if it's not a flake source (doesn't have flake.nix)
-            if dir.starts_with(&store_dir) && !dir.join("flake.nix").exists() {
+            if dir.starts_with(&store_dir) && !crate::nix::check_is_flake(dir) {
                 let store_path_str = dir.display().to_string();
                 let store_name = dir
                     .file_name()
