@@ -1,6 +1,6 @@
-use crate::common::Cache;
 use anyhow::{Context, Result};
 use git2::{Repository, StatusOptions};
+use crate::common::Cache;
 use std::path::{Path, PathBuf};
 
 /// Cache for git info per directory (canonical path -> GitInfo)
