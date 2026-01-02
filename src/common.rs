@@ -12,7 +12,7 @@ impl<K, V> Default for Cache<K, V>
 where
     K: Eq + Hash,
     V: Clone,
-{
+ {
     fn default() -> Self {
         Self::new()
     }
@@ -48,7 +48,7 @@ pub struct Memoized<T> {
 impl<T> Default for Memoized<T>
 where
     T: Clone,
-{
+ {
     fn default() -> Self {
         Self::new()
     }
