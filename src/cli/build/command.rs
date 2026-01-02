@@ -4,6 +4,11 @@ use crate::nix::{get_system, BuildOptions};
 use anyhow::Result;
 use clap::Args;
 
+enum BuildSource {
+    File(String),
+    Expr(String),
+}
+
 #[derive(Args, Clone, Debug)]
 pub struct BuildArgs {
     /// Installable reference (e.g., '.#hello', 'nixpkgs#cowsay')
@@ -47,13 +52,11 @@ fn parse_arg_pairs(args: &[String]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Build a package from flake.nix
-/// Build a package from flake.nix
 pub fn cmd_build(args: BuildArgs) -> Result<()> {
     // If -f is specified, bypass flake machinery entirely
     if let Some(ref file) = args.nix_file {
-        return cmd_build_file(
-            file,
+        return cmd_build_legacy(
+            BuildSource::File(file.clone()),
             &args.installable,
             if args.no_link {
                 None
@@ -75,32 +78,52 @@ pub fn cmd_build(args: BuildArgs) -> Result<()> {
     let resolved = resolve_installable(&args.installable);
 
     if !resolved.is_local {
-        // Passthrough to nix build
         let flake_ref = resolved.flake_ref.as_deref().unwrap_or("");
-        let full_ref = format!("{}#{}", flake_ref, resolved.attr_part);
 
-        let mut cmd = crate::command::NixCommand::new("nix");
-        cmd.arg("build").arg(&full_ref);
+        // If it looks like a flake, use nix build
+        if check_is_flake(flake_ref) {
+            // Passthrough to nix build
+            let full_ref = format!("{}#{}", flake_ref, resolved.attr_part);
 
-        if args.no_link {
-            cmd.arg("--no-link");
-        } else if let Some(link) = out_link {
-            cmd.args(["-o", link]);
+            let mut cmd = crate::command::NixCommand::new("nix");
+            cmd.arg("build").arg(&full_ref);
+
+            if args.no_link {
+                cmd.arg("--no-link");
+            } else if let Some(link) = out_link {
+                cmd.args(["-o", link]);
+            }
+
+            if let Some(s) = &args.store {
+                cmd.args(["--store", s]);
+            }
+
+            for (name, expr) in parse_arg_pairs(&args.extra_args) {
+                cmd.args(["--arg", &name, &expr]);
+            }
+
+            for (name, value) in parse_arg_pairs(&args.extra_argstrs) {
+                cmd.args(["--argstr", &name, &value]);
+            }
+
+            return cmd.run();
+        } else {
+            // Not a flake, try legacy build with fetchTree
+            tracing::info!("Repository does not appear to be a flake, attempting legacy build...");
+
+            // Use builtins.fetchTree with the provided URL string directly
+            // This works with either github:owner/repo or https://github.com/owner/repo
+            let expr = format!("import (builtins.fetchTree {:?})", flake_ref);
+
+            return cmd_build_legacy(
+                BuildSource::Expr(expr),
+                &resolved.attr_part,
+                out_link,
+                parse_arg_pairs(&args.extra_args),
+                parse_arg_pairs(&args.extra_argstrs),
+                args.store.as_deref(),
+            );
         }
-
-        if let Some(s) = &args.store {
-            cmd.args(["--store", s]);
-        }
-
-        for (name, expr) in parse_arg_pairs(&args.extra_args) {
-            cmd.args(["--arg", &name, &expr]);
-        }
-
-        for (name, value) in parse_arg_pairs(&args.extra_argstrs) {
-            cmd.args(["--argstr", &name, &value]);
-        }
-
-        return cmd.run();
     }
 
     let system = get_system()?;
@@ -125,8 +148,8 @@ pub fn cmd_build(args: BuildArgs) -> Result<()> {
 }
 
 /// Build from a plain Nix file (bypasses flake machinery).
-fn cmd_build_file(
-    nix_file: &str,
+fn cmd_build_legacy(
+    source: BuildSource,
     attr: &str,
     out_link: Option<&str>,
     extra_args: Vec<(String, String)>,
@@ -134,9 +157,17 @@ fn cmd_build_file(
     store: Option<&str>,
 ) -> Result<()> {
     let mut cmd = crate::command::NixCommand::new("nix-build");
-    cmd.arg(nix_file);
 
-    // Attribute becomes -A when using -f
+    match source {
+        BuildSource::File(path) => {
+            cmd.arg(path);
+        }
+        BuildSource::Expr(expr) => {
+            cmd.args(["-E", &expr]);
+        }
+    }
+
+    // Attribute becomes -A when using -f or -E
     if attr != ".#default" && attr != "." && !attr.is_empty() {
         // Strip any .# prefix if present
         let attr = attr.strip_prefix(".#").unwrap_or(attr);
@@ -167,4 +198,27 @@ fn cmd_build_file(
     }
 
     cmd.run()
+}
+
+fn check_is_flake(flake_ref: &str) -> bool {
+    let mut cmd = crate::command::NixCommand::new("nix");
+    cmd.args(["flake", "metadata", flake_ref]);
+
+    // Suppress output
+    match cmd.output() {
+        Ok(_) => true,
+        Err(e) => {
+            let msg = e.to_string();
+
+            // If it explicitly says it's not a flake, return false
+            if msg.contains("does not contain a 'flake.nix'")
+                || msg.contains("/flake.nix' does not exist")
+            {
+                return false;
+            }
+
+            // For other errors, assume it might be a flake or let nix build report the error
+            true
+        }
+    }
 }
