@@ -132,7 +132,11 @@ pub fn attr_to_nix_list(attr: &str) -> String {
 /// Prepare common flake arguments (is_flake, self_info, lock).
 fn prepare_flake_args(flake_dir: &Path) -> (bool, String, String) {
     if flake_dir.join("flake.nix").exists() {
-        (true, get_self_info_expr(flake_dir), get_lock_expr(flake_dir))
+        (
+            true,
+            get_self_info_expr(flake_dir),
+            get_lock_expr(flake_dir),
+        )
     } else {
         (false, "{}".to_string(), "{}".to_string())
     }
