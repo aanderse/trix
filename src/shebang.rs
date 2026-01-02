@@ -212,7 +212,10 @@ mod tests {
 
     #[test]
     fn test_parse_args_simple() {
-        assert_eq!(parse_args("develop -i python3"), vec!["develop", "-i", "python3"]);
+        assert_eq!(
+            parse_args("develop -i python3"),
+            vec!["develop", "-i", "python3"]
+        );
     }
 
     #[test]
