@@ -140,14 +140,13 @@ fn parse_shebang_directives(path: &Path) -> Option<Vec<String>> {
         }
 
         // Check for trix directive lines
-        // Match: #!trix, #! trix, # !trix, # ! trix
-        let directive = if let Some(rest) = trimmed.strip_prefix("#!trix") {
+        // Robustly parse: # [whitespace] ! [whitespace] trix
+        let directive = (|| {
+            let rest = trimmed.strip_prefix('#')?.trim_start();
+            let rest = rest.strip_prefix('!')?.trim_start();
+            let rest = rest.strip_prefix("trix")?;
             Some(rest)
-        } else if let Some(rest) = trimmed.strip_prefix("#! trix") {
-            Some(rest)
-        } else if let Some(rest) = trimmed.strip_prefix("# !trix") {
-            Some(rest)
-        } else { trimmed.strip_prefix("# ! trix") };
+        })();
 
         if let Some(rest) = directive {
             // Parse the rest of the line as shell-like arguments
