@@ -3,26 +3,25 @@
 //! This module provides functions to run nix commands (nix-build, nix-shell, nix-instantiate)
 //! with the trix evaluation wrapper.
 
+use crate::common::Memoized;
 use anyhow::{Context, Result};
-use once_cell::sync::Lazy;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 /// Empty lock expression for flakes without a lock file
 pub const EMPTY_LOCK_EXPR: &str =
     r#"{ nodes = { root = { inputs = {}; }; }; root = "root"; version = 7; }"#;
 
 /// Cached nix dir path
-static NIX_DIR_CACHE: Lazy<Mutex<Option<PathBuf>>> = Lazy::new(|| Mutex::new(None));
+static NIX_DIR_CACHE: Memoized<PathBuf> = Memoized::new();
 
 /// Cached system value
-static SYSTEM_CACHE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+static SYSTEM_CACHE: Memoized<String> = Memoized::new();
 
 /// Cached store dir value
-static STORE_DIR_CACHE: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
+static STORE_DIR_CACHE: Memoized<String> = Memoized::new();
 
 /// Get environment suitable for spawning nix commands.
 ///
@@ -47,20 +46,14 @@ pub fn warn(msg: &str) {
 /// - Installed: share/trix/nix/ (from bin/trix)
 pub fn get_nix_dir() -> Result<PathBuf> {
     // Check cache first
-    {
-        let cache = NIX_DIR_CACHE.lock().unwrap();
-        if let Some(ref dir) = *cache {
-            return Ok(dir.clone());
-        }
+    if let Some(dir) = NIX_DIR_CACHE.get() {
+        return Ok(dir);
     }
 
     let nix_dir = find_nix_dir()?;
 
     // Cache the result
-    {
-        let mut cache = NIX_DIR_CACHE.lock().unwrap();
-        *cache = Some(nix_dir.clone());
-    }
+    NIX_DIR_CACHE.set(nix_dir.clone());
 
     Ok(nix_dir)
 }
@@ -136,20 +129,36 @@ pub fn attr_to_nix_list(attr: &str) -> String {
     format!("[{}]", quoted.join(" "))
 }
 
+/// Prepare common flake arguments (is_flake, self_info, lock).
+fn prepare_flake_args(flake_dir: &Path) -> (bool, String, String) {
+    if flake_dir.join("flake.nix").exists() {
+        (true, get_self_info_expr(flake_dir), get_lock_expr(flake_dir))
+    } else {
+        (false, "{}".to_string(), "{}".to_string())
+    }
+}
+
+/// Setup common arguments for eval.nix wrapper commands.
+fn setup_eval_command(
+    cmd: &mut crate::command::NixCommand,
+    nix_dir: &Path,
+    flake_dir: &Path,
+    attr: &str,
+) {
+    let (_, self_info_expr, _) = prepare_flake_args(flake_dir);
+    cmd.arg(nix_dir.join("eval.nix"));
+    cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
+    cmd.args(["--arg", "selfInfo", &self_info_expr]);
+    cmd.args(["--argstr", "attr", attr]);
+}
+
 /// Generate the common Nix let-bindings for evaluation.
 ///
 /// Returns Nix code that sets up the environment (helpers, outputs, etc.) for
 /// either a flake (via flake.nix) or a legacy project (via default.nix).
 pub fn get_eval_preamble(flake_dir: &Path) -> Result<String> {
     let nix_dir = get_nix_dir()?;
-    let is_flake = flake_dir.join("flake.nix").exists();
-
-    let (lock_expr, self_info_expr) = if is_flake {
-        (get_lock_expr(flake_dir), get_self_info_expr(flake_dir))
-    } else {
-        // Legacy mode: no flake.nix means no lock or self input metadata.
-        ("{}".to_string(), "{}".to_string())
-    };
+    let (is_flake, self_info_expr, lock_expr) = prepare_flake_args(flake_dir);
 
     Ok(format!(
         r#"
@@ -173,11 +182,8 @@ pub fn get_eval_preamble(flake_dir: &Path) -> Result<String> {
 /// Get the current Nix system (e.g., x86_64-linux). Result is cached.
 pub fn get_system() -> Result<String> {
     // Check cache first
-    {
-        let cache = SYSTEM_CACHE.lock().unwrap();
-        if let Some(ref system) = *cache {
-            return Ok(system.clone());
-        }
+    if let Some(system) = SYSTEM_CACHE.get() {
+        return Ok(system);
     }
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
@@ -186,10 +192,7 @@ pub fn get_system() -> Result<String> {
     let system = cmd.json().unwrap_or_else(|_| get_fallback_system());
 
     // Cache the result
-    {
-        let mut cache = SYSTEM_CACHE.lock().unwrap();
-        *cache = Some(system.clone());
-    }
+    SYSTEM_CACHE.set(system.clone());
 
     Ok(system)
 }
@@ -210,11 +213,8 @@ fn get_fallback_system() -> String {
 /// Get the Nix store directory (e.g., /nix/store). Result is cached.
 pub fn get_store_dir() -> Result<String> {
     // Check cache first
-    {
-        let cache = STORE_DIR_CACHE.lock().unwrap();
-        if let Some(ref store_dir) = *cache {
-            return Ok(store_dir.clone());
-        }
+    if let Some(store_dir) = STORE_DIR_CACHE.get() {
+        return Ok(store_dir);
     }
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
@@ -223,10 +223,7 @@ pub fn get_store_dir() -> Result<String> {
     let store_dir = cmd.json().unwrap_or_else(|_| "/nix/store".to_string());
 
     // Cache the result
-    {
-        let mut cache = STORE_DIR_CACHE.lock().unwrap();
-        *cache = Some(store_dir.clone());
-    }
+    STORE_DIR_CACHE.set(store_dir.clone());
 
     Ok(store_dir)
 }
@@ -287,12 +284,7 @@ pub fn run_nix_build(
 
     if flake_dir.join("flake.nix").exists() {
         let nix_dir = get_nix_dir()?;
-        let self_info_expr = get_self_info_expr(flake_dir);
-
-        cmd.arg(nix_dir.join("eval.nix"));
-        cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
-        cmd.args(["--arg", "selfInfo", &self_info_expr]);
-        cmd.args(["--argstr", "attr", attr]);
+        setup_eval_command(&mut cmd, &nix_dir, flake_dir, attr);
     } else {
         // Legacy mode: use standard nix-build with attribute path.
         cmd.arg(flake_dir);
@@ -345,13 +337,9 @@ impl CommonNixOptions for ShellOptions {
 /// Run nix-shell with eval.nix wrapper. Replaces current process.
 pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Result<()> {
     let nix_dir = get_nix_dir()?;
-    let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-shell");
-    cmd.arg(nix_dir.join("eval.nix"));
-    cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
-    cmd.args(["--arg", "selfInfo", &self_info_expr]);
-    cmd.args(["--argstr", "attr", attr]);
+    setup_eval_command(&mut cmd, &nix_dir, flake_dir, attr);
 
     apply_common_args(&mut cmd, options);
 
@@ -583,17 +571,7 @@ pub fn get_package_main_program(flake_dir: &Path, attr: &str) -> Result<String> 
 /// Run nix repl with flake context loaded. Replaces current process.
 pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
     let nix_dir = get_nix_dir()?;
-    let is_flake = flake_dir.join("flake.nix").exists();
-    let self_info_expr = if is_flake {
-        get_self_info_expr(flake_dir)
-    } else {
-        "{}".to_string()
-    };
-    let lock_expr = if is_flake {
-        get_lock_expr(flake_dir)
-    } else {
-        "{}".to_string() // Empty lock for legacy
-    };
+    let (is_flake, self_info_expr, lock_expr) = prepare_flake_args(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix");
     cmd.args(["repl", "--file"]);
@@ -609,13 +587,9 @@ pub fn run_nix_repl(flake_dir: &Path) -> Result<()> {
 /// Get the derivation path for a flake attribute without building.
 pub fn get_derivation_path(flake_dir: &Path, attr: &str) -> Result<String> {
     let nix_dir = get_nix_dir()?;
-    let self_info_expr = get_self_info_expr(flake_dir);
 
     let mut cmd = crate::command::NixCommand::new("nix-instantiate");
-    cmd.arg(nix_dir.join("eval.nix"));
-    cmd.args(["--arg", "flakeDir", &flake_dir.display().to_string()]);
-    cmd.args(["--arg", "selfInfo", &self_info_expr]);
-    cmd.args(["--argstr", "attr", attr]);
+    setup_eval_command(&mut cmd, &nix_dir, flake_dir, attr);
 
     cmd.output()
 }

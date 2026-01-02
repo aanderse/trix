@@ -1,17 +1,14 @@
 //! Flake handling - parsing, URL resolution, lock management.
 
 use anyhow::Result;
-use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
+use crate::common::Cache;
 use crate::registry::{is_registry_name, registry_entry_to_flake_ref, resolve_registry_name};
 
 /// Cache for flake inputs per directory (canonical path -> inputs JSON)
-static FLAKE_INPUTS_CACHE: Lazy<Mutex<HashMap<PathBuf, serde_json::Value>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static FLAKE_INPUTS_CACHE: Cache<PathBuf, serde_json::Value> = Cache::new();
 
 /// Result of resolving an installable reference.
 ///
@@ -174,11 +171,8 @@ pub fn get_flake_inputs(flake_dir: &Path) -> Result<serde_json::Value> {
         .unwrap_or_else(|_| flake_dir.to_path_buf());
 
     // Check cache first
-    {
-        let cache = FLAKE_INPUTS_CACHE.lock().unwrap();
-        if let Some(inputs) = cache.get(&canonical) {
-            return Ok(inputs.clone());
-        }
+    if let Some(inputs) = FLAKE_INPUTS_CACHE.get(&canonical) {
+        return Ok(inputs);
     }
 
     let nix_dir = crate::nix::get_nix_dir()?;
@@ -292,10 +286,7 @@ pub fn get_flake_inputs(flake_dir: &Path) -> Result<serde_json::Value> {
     let result = serde_json::Value::Object(parsed);
 
     // Cache the result
-    {
-        let mut cache = FLAKE_INPUTS_CACHE.lock().unwrap();
-        cache.insert(canonical, result.clone());
-    }
+    FLAKE_INPUTS_CACHE.insert(canonical, result.clone());
 
     Ok(result)
 }

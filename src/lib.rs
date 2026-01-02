@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod command;
+pub mod common;
 pub mod flake;
 pub mod git;
 pub mod lock;
