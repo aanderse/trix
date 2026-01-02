@@ -1,6 +1,10 @@
+use crate::common::Cache;
 use crate::nix::get_clean_env;
 use anyhow::{Context, Result};
 use std::process::Command;
+
+/// Cache for program availability checks
+static PROGRAM_AVAILABILITY: Cache<String, bool> = Cache::new();
 
 pub struct NixCommand {
     cmd: Command,
@@ -8,6 +12,12 @@ pub struct NixCommand {
 
 impl NixCommand {
     pub fn new(program: &str) -> Self {
+        let program = match program {
+            "nix" if is_program_available("nom") => "nom",
+            "nix-build" if is_program_available("nom-build") => "nom-build",
+            _ => program,
+        };
+
         let mut cmd = Command::new(program);
         // Add experimental features flag unconditionally for now
         cmd.args(["--extra-experimental-features", "flakes nix-command"]);
@@ -97,6 +107,43 @@ impl NixCommand {
     }
 }
 
+/// Check if a program is available in PATH
+fn is_program_available(program: &str) -> bool {
+    if let Some(available) = PROGRAM_AVAILABILITY.get(&program.to_string()) {
+        return available;
+    }
+
+    let available = check_program_in_path(program);
+    PROGRAM_AVAILABILITY.insert(program.to_string(), available);
+    available
+}
+
+fn check_program_in_path(program: &str) -> bool {
+    if let Some(paths) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&paths) {
+            let user_path = path.join(program);
+            if user_path.is_file() && is_executable(&user_path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn is_executable(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(metadata) = path.metadata() {
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    false
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &std::path::Path) -> bool {
+    true // Assume executable on non-unix for simplicity if it's a file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +169,35 @@ mod tests {
     fn test_get_program() {
         let cmd = NixCommand::new("nix-store");
         assert_eq!(cmd.get_program(), "nix-store");
+    }
+
+    #[test]
+    fn test_is_program_available() {
+        use std::fs::File;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let program_name = "test_program_12345";
+        let program_path = dir.path().join(program_name);
+
+        File::create(&program_path).unwrap();
+        let mut perms = std::fs::metadata(&program_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&program_path, perms).unwrap();
+
+        let path = std::env::var_os("PATH").unwrap();
+        let mut paths = std::env::split_paths(&path).collect::<Vec<_>>();
+        paths.push(dir.path().to_path_buf());
+        let new_path = std::env::join_paths(paths).unwrap();
+
+        // Safety: this is a test, and we are modifying the environment.
+        // This might race with other tests if checking PATH, but we are using a unique name.
+        unsafe {
+            std::env::set_var("PATH", new_path);
+        }
+
+        assert!(check_program_in_path(program_name));
+        assert!(!check_program_in_path("non_existent_program_98765"));
     }
 }
