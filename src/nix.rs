@@ -282,7 +282,7 @@ pub fn run_nix_build(
 ) -> Result<Option<String>> {
     let mut cmd = crate::command::NixCommand::new("nix-build");
 
-    if flake_dir.join("flake.nix").exists() {
+    if check_is_flake(flake_dir) {
         let nix_dir = get_nix_dir()?;
         setup_eval_command(&mut cmd, &nix_dir, flake_dir, attr);
     } else {
@@ -725,6 +725,30 @@ pub fn get_flake_output_categories(flake_dir: &Path) -> Result<Option<Vec<String
         Err(e) => {
             tracing::debug!("{}", e);
             Ok(None)
+        }
+    }
+}
+
+/// Check if a flake ref (path or URL) is a flake.
+pub fn check_is_flake(flake_ref: &Path) -> bool {
+    let mut cmd = crate::command::NixCommand::new("nix");
+    cmd.arg("flake").arg("metadata").arg(flake_ref);
+
+    // Suppress output
+    match cmd.output() {
+        Ok(_) => true,
+        Err(e) => {
+            let msg = e.to_string();
+
+            // If it explicitly says it's not a flake, return false
+            if msg.contains("does not contain a 'flake.nix'")
+                || msg.contains("/flake.nix' does not exist")
+            {
+                return false;
+            }
+
+            // For other errors, assume it might be a flake or let nix build report the error
+            true
         }
     }
 }

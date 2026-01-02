@@ -74,7 +74,11 @@ pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
     // If -i (interpreter) is specified with a script, build the command
     let effective_command = if let Some(ref interpreter) = args.interpreter {
         if let Some(ref script) = args.script {
-            Some(build_interpreter_command(interpreter, script, &args.script_args))
+            Some(build_interpreter_command(
+                interpreter,
+                script,
+                &args.script_args,
+            ))
         } else {
             // -i without script: just use the interpreter as the command
             Some(interpreter.clone())

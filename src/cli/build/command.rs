@@ -81,7 +81,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<()> {
         let flake_ref = resolved.flake_ref.as_deref().unwrap_or("");
 
         // If it looks like a flake, use nix build
-        if check_is_flake(flake_ref) {
+        if crate::nix::check_is_flake(std::path::Path::new(flake_ref)) {
             // Passthrough to nix build
             let full_ref = format!("{}#{}", flake_ref, resolved.attr_part);
 
@@ -198,27 +198,4 @@ fn cmd_build_legacy(
     }
 
     cmd.run()
-}
-
-fn check_is_flake(flake_ref: &str) -> bool {
-    let mut cmd = crate::command::NixCommand::new("nix");
-    cmd.args(["flake", "metadata", flake_ref]);
-
-    // Suppress output
-    match cmd.output() {
-        Ok(_) => true,
-        Err(e) => {
-            let msg = e.to_string();
-
-            // If it explicitly says it's not a flake, return false
-            if msg.contains("does not contain a 'flake.nix'")
-                || msg.contains("/flake.nix' does not exist")
-            {
-                return false;
-            }
-
-            // For other errors, assume it might be a flake or let nix build report the error
-            true
-        }
-    }
 }

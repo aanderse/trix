@@ -34,7 +34,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Build a package from flake.nix or a Nix file
-    /// Build a package from flake.nix or a Nix file
     Build(cli::build::BuildArgs),
 
     /// Enter a development shell from flake.nix
@@ -43,7 +42,6 @@ enum Commands {
     /// Evaluate a flake attribute or Nix expression
     Eval(cli::eval::EvalArgs),
 
-    /// Build and run a package or app from flake.nix
     /// Build and run a package or app from flake.nix
     Run(cli::run::RunArgs),
 
