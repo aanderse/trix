@@ -12,12 +12,14 @@
 let
   nodes = lock.nodes or { };
 
-  # Resolve a follows path through the lock file
+  # Resolve a follows path through a given nodes context
   # e.g., ["nixpkgs"] -> root.inputs.nixpkgs -> nixpkgs input
   # e.g., ["foo", "nixpkgs"] -> root.inputs.foo -> foo.inputs.nixpkgs -> final input
   # Includes cycle detection to prevent infinite loops
-  resolveFollowsWithVisited =
-    visited: path:
+  # nodesContext: the nodes map to use for resolution
+  # basePath: base path for resolving path inputs
+  resolveFollowsInContext =
+    nodesContext: basePath: visited: path:
     let
       pathKey = builtins.concatStringsSep "/" path;
       newVisited = visited ++ [ pathKey ];
@@ -28,7 +30,7 @@ let
           acc
         else
           let
-            node = nodes.${acc};
+            node = nodesContext.${acc};
             ref = node.inputs.${elem} or (throw "trix: input '${elem}' not found in node '${acc}'");
           in
           if builtins.isString ref then
@@ -43,14 +45,15 @@ let
                 builtins.concatStringsSep " -> " (newVisited ++ [ refKey ])
               }"
             else
-              resolveFollowsWithVisited newVisited ref;
+              resolveFollowsInContext nodesContext basePath newVisited ref;
       result = builtins.foldl' step "root" path;
     in
     # If result is already a resolved input (attrset), return it directly
     # Otherwise it's a node name that needs to be built
-    if builtins.isAttrs result then result else buildInput result nodes.${result} flakeDirPath;
+    if builtins.isAttrs result then result else buildInput nodesContext result nodesContext.${result} basePath;
 
-  resolveFollows = resolveFollowsWithVisited [ ];
+  # Default resolver for the main lock file
+  resolveFollows = resolveFollowsInContext nodes flakeDirPath [ ];
 
   # Fetch a source based on the native flake.lock format
   # basePath is used for resolving relative path inputs
@@ -116,9 +119,10 @@ let
     builtins.removeAttrs attrs (builtins.filter (n: attrs.${n} == null) (builtins.attrNames attrs));
 
   # Build an input value from a fetched source
+  # nodesContext is the nodes map to use for resolving input references
   # basePath is used for resolving relative path inputs in this node
   buildInput =
-    name: node: basePath:
+    nodesContext: name: node: basePath:
     let
       src = fetchSource name node basePath;
       isFlake = node.flake or true;
@@ -157,6 +161,7 @@ let
 
         # Helper to build an input from the transitive flake's own lock
         # Uses src as the base path since we're resolving relative to this input's directory
+        # Uses inputLockNodes as the context for resolving nested input references
         buildFromInputLock =
           iname:
           let
@@ -164,7 +169,7 @@ let
             refNodeName = if builtins.isString ref then ref else builtins.head ref;
             refNode = inputLockNodes.${refNodeName};
           in
-          buildInput iname refNode src;
+          buildInput inputLockNodes iname refNode src;
 
         # What inputs does this flake actually need?
         # Some flakes declare inputs explicitly, others infer them from outputs args
@@ -187,7 +192,23 @@ let
                 let
                   ref = nodeInputs.${iname};
                 in
-                if builtins.isString ref then buildInput iname nodes.${ref} flakeDirPath else resolveFollows ref
+                if builtins.isString ref then
+                  # String ref - check if it exists in nodesContext, otherwise fall back to input's own lock
+                  if nodesContext ? ${ref} then
+                    buildInput nodesContext iname nodesContext.${ref} basePath
+                  else if inputLockNodes ? ${ref} then
+                    # Reference exists in input's own lock by exact name
+                    buildInput inputLockNodes iname inputLockNodes.${ref} src
+                  else if inputLockRootInputs ? ${iname} then
+                    # Node ref doesn't exist, but input's lock has this input - use it
+                    # This handles cases where main lock has renamed refs (e.g., flake-utils_2)
+                    # but the transitive lock uses original names (flake-utils)
+                    buildFromInputLock iname
+                  else
+                    throw "trix: node '${ref}' not found for input '${iname}' in '${name}'"
+                else
+                  # Follows ref - try nodesContext first, fall back to input's lock
+                  resolveFollowsInContext nodesContext basePath [ ] ref
               else if inputLockRootInputs ? ${iname} then
                 # Use the input's own flake.lock
                 buildFromInputLock iname
@@ -226,7 +247,7 @@ let
     name: ref:
     if builtins.isString ref then
       # Normal reference - build from node
-      buildInput name nodes.${ref} flakeDirPath
+      buildInput nodes name nodes.${ref} flakeDirPath
     else if builtins.isList ref then
       # Root-level follows reference - resolve
       resolveFollows ref
