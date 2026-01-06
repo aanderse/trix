@@ -1,0 +1,163 @@
+//! Shell command - start a shell with specified packages available.
+
+use std::env;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
+
+use anyhow::{anyhow, Context, Result};
+use clap::Args;
+use tracing::{debug, info, instrument};
+
+use crate::eval::Evaluator;
+use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
+use crate::progress;
+
+#[derive(Args)]
+pub struct ShellArgs {
+    /// Package installables to make available (e.g., '.#hello', 'nixpkgs#cowsay')
+    #[arg(required = true)]
+    pub installables: Vec<String>,
+
+    /// Command to run in the shell
+    #[arg(short = 'c', long)]
+    pub command: Option<String>,
+}
+
+#[instrument(level = "debug", skip_all)]
+pub fn run(args: ShellArgs) -> Result<()> {
+    let cwd = env::current_dir().context("failed to get current directory")?;
+
+    // First, check if any installable is remote
+    let mut has_remote = false;
+    for installable in &args.installables {
+        let resolved = resolve_installable_any(installable, &cwd);
+        if !resolved.is_local {
+            has_remote = true;
+            break;
+        }
+    }
+
+    // If any are remote, passthrough all to nix shell
+    if has_remote {
+        return run_remote(&args);
+    }
+
+    // All local - use native evaluation
+    let system = current_system()?;
+    let mut store_paths = Vec::new();
+    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
+
+    // Build each installable
+    for installable in &args.installables {
+        debug!("processing installable: {}", installable);
+
+        let resolved = resolve_installable_any(installable, &cwd);
+        let flake_path = resolved.path.expect("local flake should have path");
+        let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
+        let attr_path = &candidates[0];
+
+        let eval_target = format!("{}#{}", flake_path.display(), attr_path.join("."));
+        info!("evaluating {}", eval_target);
+
+        let status = progress::evaluating(&eval_target);
+
+        // Evaluate using native evaluator
+        let value = eval
+            .eval_flake_attr(&flake_path, attr_path)
+            .context(format!("failed to evaluate {}", installable))?;
+
+        status.finish_and_clear();
+
+        let drv_path = eval.get_drv_path(&value)?;
+        debug!(drv = %drv_path, "got derivation path");
+
+        // Build it
+        info!("building {}", drv_path);
+        let build_status = progress::building(&drv_path);
+
+        let store_path = eval.build_value(&value)?;
+
+        build_status.finish_and_clear();
+        store_paths.push(store_path);
+    }
+
+    // Build PATH with all package bin directories
+    let mut bin_paths = Vec::new();
+    for store_path in &store_paths {
+        let bin_dir = std::path::Path::new(store_path).join("bin");
+        if bin_dir.is_dir() {
+            bin_paths.push(bin_dir.to_string_lossy().into_owned());
+        }
+    }
+
+    if bin_paths.is_empty() {
+        return Err(anyhow!("no bin directories found in packages"));
+    }
+
+    // Prepend to existing PATH
+    let old_path = env::var("PATH").unwrap_or_default();
+    let mut new_path_parts = bin_paths;
+    if !old_path.is_empty() {
+        new_path_parts.push(old_path);
+    }
+    let new_path = new_path_parts.join(":");
+
+    if let Some(cmd_str) = &args.command {
+        // Run command and exit
+        debug!("running command: sh -c {}", cmd_str);
+
+        let status = Command::new("sh")
+            .args(["-c", cmd_str])
+            .env("PATH", &new_path)
+            .status()
+            .context("failed to run command")?;
+
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    } else {
+        // Start interactive shell
+        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+        debug!("starting shell: {}", shell);
+        info!("entering shell with {} packages", store_paths.len());
+
+        let status = Command::new(&shell)
+            .env("PATH", &new_path)
+            .status()
+            .context(format!("failed to run {}", shell))?;
+
+        if !status.success() {
+            std::process::exit(status.code().unwrap_or(1));
+        }
+    }
+
+    Ok(())
+}
+
+/// Passthrough to nix shell for remote installables
+fn run_remote(args: &ShellArgs) -> Result<()> {
+    info!(
+        "running shell with {} packages (remote, delegating to nix)",
+        args.installables.len()
+    );
+
+    let mut cmd = Command::new("nix");
+    cmd.arg("shell");
+
+    // Add all installables
+    for installable in &args.installables {
+        cmd.arg(installable);
+    }
+
+    // Add command if specified
+    if let Some(ref cmd_str) = args.command {
+        cmd.args(["--command", "sh", "-c", cmd_str]);
+    }
+
+    debug!("+ nix shell {:?}", args.installables);
+
+    // exec replaces the current process
+    let err = cmd.exec();
+    Err(anyhow!("failed to exec nix shell: {}", err))
+}

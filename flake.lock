@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "nix-bindings-rust": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1767664784,
+        "narHash": "sha256-sXQhSXmsZ1cCqmlfahjdbCv/MMeGYb680PELVgkqLIs=",
+        "owner": "aanderse",
+        "repo": "nix-bindings-rust",
+        "rev": "8f6ec2ec5c3ba8ab33126ec79de7702835592902",
+        "type": "github"
+      },
+      "original": {
+        "owner": "aanderse",
+        "repo": "nix-bindings-rust",
+        "rev": "8f6ec2ec5c3ba8ab33126ec79de7702835592902",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1767116409,
+        "narHash": "sha256-5vKw92l1GyTnjoLzEagJy5V5mDFck72LiQWZSOnSicw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "cad22e7d996aea55ecab064e84834289143e44a0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "nix-bindings-rust": "nix-bindings-rust",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

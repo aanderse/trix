@@ -1,0 +1,69 @@
+[package]
+name = "trix"
+version = "0.1.0"
+edition = "2021"
+description = "A Nix flake CLI that never copies your project to the store"
+license = "MIT"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+
+# Error handling
+anyhow = "1"
+
+# Serialization (flake.lock)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Time formatting
+chrono = "0.4"
+
+# Git metadata (without copying to store)
+git2 = "0.18"
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Terminal colors (zero-alloc, supports NO_COLOR)
+owo-colors = { version = "4", features = ["supports-colors"] }
+
+# Progress indicators and spinners
+indicatif = "0.17"
+
+# HTTP client for fetching global registry
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+
+# Home directory detection
+dirs = "5"
+
+# Shell expansion (~)
+shellexpand = "3"
+
+# Lazy static initialization
+once_cell = "1"
+
+# Regular expressions
+regex = "1"
+
+# Parallel iteration
+rayon = "1"
+
+# Temporary files
+tempfile = "3"
+
+# Directory traversal
+walkdir = "2"
+
+# Nix bindings for native evaluation (using local clone with path coercion fix)
+nix-bindings-util = { path = "../nix-bindings-rust/nix-bindings-util" }
+nix-bindings-store = { path = "../nix-bindings-rust/nix-bindings-store" }
+nix-bindings-expr = { path = "../nix-bindings-rust/nix-bindings-expr" }
+nix-bindings-flake = { path = "../nix-bindings-rust/nix-bindings-flake" }
+nix-bindings-fetchers = { path = "../nix-bindings-rust/nix-bindings-fetchers" }
+
+[dev-dependencies]
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

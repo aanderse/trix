@@ -1,0 +1,22 @@
+# trix direnv integration
+#
+# Add this to your ~/.direnvrc or ~/.config/direnv/direnvrc:
+#   source "$(nix eval --raw 'nixpkgs#trix')/share/trix/direnvrc"
+# Or if trix is in your PATH:
+#   source "$(dirname "$(command -v trix)")/../share/trix/direnvrc"
+#
+# Then in your project's .envrc:
+#   use trix
+#   use trix .#myshell  # for a specific devShell
+#
+# This works like nix-direnv's use_flake but uses trix instead.
+
+use_trix() {
+  watch_file flake.nix
+  watch_file flake.lock
+  local flake_ref="${1:-.}"
+  direnv_load trix develop "$flake_ref" -c "$(join_args "$direnv" dump)"
+  # Unset TMPDIR and related variables - nix-shell sets these to a session-specific
+  # temp directory that gets cleaned up when nix-shell exits, leaving a stale path
+  unset TMPDIR TEMP TEMPDIR TMP NIX_BUILD_TOP
+}
