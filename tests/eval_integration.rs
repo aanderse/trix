@@ -362,3 +362,38 @@ fn sops_nix_overlay_exists() {
     assert_eq!(nix.is_err(), trix.is_err(),
         "nix and trix should agree on overlays.default\nnix: {:?}\ntrix: {:?}", nix, trix);
 }
+
+// =============================================================================
+// NixOS/nix - Complex flake with empty follows, flake-parts, tarball inputs
+// This flake exercises:
+// - Empty follows (e.g., "gitignore": [], "flake-compat": [])
+// - flake-parts integration
+// - Tarball inputs (nixpkgs from releases.nixos.org)
+// - Complex input graph with multiple dependencies
+// =============================================================================
+
+const NIX_REV: &str = "b474e8d249964ac24cf003837a1aba0b2c700156";
+
+#[test]
+#[ignore] // Slow due to nixpkgs and multiple dependencies
+fn nix_package_name() {
+    let flake = fetch_github_flake("NixOS", "nix", NIX_REV)
+        .expect("failed to fetch nix");
+    compare_eval(flake.path(), "packages.x86_64-linux.default.name");
+}
+
+#[test]
+#[ignore] // Slow due to nixpkgs and multiple dependencies
+fn nix_package_version() {
+    let flake = fetch_github_flake("NixOS", "nix", NIX_REV)
+        .expect("failed to fetch nix");
+    compare_eval(flake.path(), "packages.x86_64-linux.default.version");
+}
+
+#[test]
+#[ignore] // Slow due to nixpkgs and multiple dependencies
+fn nix_devshell_name() {
+    let flake = fetch_github_flake("NixOS", "nix", NIX_REV)
+        .expect("failed to fetch nix");
+    compare_eval(flake.path(), "devShells.x86_64-linux.default.name");
+}

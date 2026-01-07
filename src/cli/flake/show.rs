@@ -393,6 +393,10 @@ fn build_per_system_node(
 }
 
 /// Build a node for hydraJobs (special nested structure)
+/// hydraJobs can have various structures:
+/// - hydraJobs.<job>.<system> = derivation (most common)
+/// - hydraJobs.<job>.<system>.<crossTarget> = derivation (cross-compilation)
+/// - hydraJobs.<job>.<system>.<subJob> = derivation (nested jobs)
 fn build_hydra_jobs_node(
     evaluator: &mut Evaluator,
     hydra_jobs: &crate::eval::NixValue,
@@ -402,37 +406,8 @@ fn build_hydra_jobs_node(
 
     for job_name in &job_names {
         if let Some(job_value) = evaluator.get_attr(hydra_jobs, job_name)? {
-            if !evaluator.is_attrs(&job_value)? {
-                continue;
-            }
-
-            let mut job_map = BTreeMap::new();
-            let systems = evaluator.get_attr_names(&job_value)?;
-
-            for system in systems.iter().filter(|s| is_system_name(s)) {
-                if let Some(sys_value) = evaluator.get_attr(&job_value, system)? {
-                    if !evaluator.is_attrs(&sys_value)? {
-                        continue;
-                    }
-
-                    let mut sys_map = BTreeMap::new();
-                    let outputs = evaluator.get_attr_names(&sys_value)?;
-
-                    for output_name in &outputs {
-                        if let Some(output_value) = evaluator.get_attr(&sys_value, output_name)? {
-                            let node = build_value_node(evaluator, &output_value, "hydraJobs")?;
-                            sys_map.insert(output_name.clone(), node);
-                        }
-                    }
-
-                    if !sys_map.is_empty() {
-                        job_map.insert(system.clone(), OutputNode::AttrSet(sys_map));
-                    }
-                }
-            }
-
-            if !job_map.is_empty() {
-                result.insert(job_name.clone(), OutputNode::AttrSet(job_map));
+            if let Some(node) = build_hydra_job_level(evaluator, &job_value)? {
+                result.insert(job_name.clone(), node);
             }
         }
     }
@@ -441,6 +416,46 @@ fn build_hydra_jobs_node(
         Ok(None)
     } else {
         Ok(Some(OutputNode::AttrSet(result)))
+    }
+}
+
+/// Recursively build nodes for hydraJobs at any nesting level.
+/// At each level, check if we have a derivation; if not, recurse into children.
+fn build_hydra_job_level(
+    evaluator: &mut Evaluator,
+    value: &crate::eval::NixValue,
+) -> Result<Option<OutputNode>> {
+    // Check if this is directly a derivation
+    if is_derivation(evaluator, value)? {
+        return Ok(Some(build_derivation_node(evaluator, value, "hydraJobs")?));
+    }
+
+    // Not a derivation - check if it's an attrset
+    if !evaluator.is_attrs(value)? {
+        return Ok(None);
+    }
+
+    // Recurse into children
+    let mut children = BTreeMap::new();
+    let attr_names = evaluator.get_attr_names(value)?;
+
+    // Empty attrset - still include it (nix shows as {})
+    if attr_names.is_empty() {
+        return Ok(Some(OutputNode::AttrSet(children)));
+    }
+
+    for attr_name in &attr_names {
+        if let Some(attr_value) = evaluator.get_attr(value, attr_name)? {
+            if let Some(node) = build_hydra_job_level(evaluator, &attr_value)? {
+                children.insert(attr_name.clone(), node);
+            }
+        }
+    }
+
+    if children.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(OutputNode::AttrSet(children)))
     }
 }
 
@@ -641,10 +656,14 @@ fn render_as_json(node: &OutputNode) -> serde_json::Value {
         }
         OutputNode::App {
             name: _,
-            description: _,
+            description,
         } => {
-            // nix flake show --json only outputs {"type": "app"} for apps
-            json!({ "type": "app" })
+            // nix flake show --json outputs {"type": "app", "description": "..."} if description exists
+            if let Some(desc) = description {
+                json!({ "type": "app", "description": desc })
+            } else {
+                json!({ "type": "app" })
+            }
         }
         OutputNode::Opaque {
             output_category,

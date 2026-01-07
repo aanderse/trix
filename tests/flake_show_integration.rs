@@ -350,3 +350,31 @@ fn nixos_branding_show_all_systems() {
         fetch_github_flake("NixOS", "branding", NIXOS_BRANDING_REV).expect("failed to fetch nixos branding");
     compare_flake_show(flake.path(), true);
 }
+
+// =============================================================================
+// NixOS/nix - Complex flake with empty follows, flake-parts, tarball inputs
+// This flake exercises:
+// - Empty follows (e.g., "gitignore": [], "flake-compat": [])
+// - flake-parts integration
+// - Tarball inputs (nixpkgs from releases.nixos.org)
+// - Complex input graph with multiple dependencies
+// - Complex hydraJobs structure with nested derivations
+// =============================================================================
+
+const NIX_REV: &str = "b474e8d249964ac24cf003837a1aba0b2c700156";
+
+#[test]
+#[ignore] // Slow due to nixpkgs and multiple dependencies
+fn nix_show() {
+    let flake =
+        fetch_github_flake("NixOS", "nix", NIX_REV).expect("failed to fetch nix");
+    compare_flake_show(flake.path(), false);
+}
+
+#[test]
+#[ignore] // Very slow - all systems evaluation
+fn nix_show_all_systems() {
+    let flake =
+        fetch_github_flake("NixOS", "nix", NIX_REV).expect("failed to fetch nix");
+    compare_flake_show(flake.path(), true);
+}

@@ -29,6 +29,8 @@
               pkgs.pkg-config
               # Nix libraries for nix-bindings
               pkgs.nix
+              # Use system libgit2 (same version as nix) to avoid conflicts
+              pkgs.libgit2
               # For bindgen (generates FFI bindings)
               pkgs.llvmPackages.libclang
             ];
@@ -38,6 +40,9 @@
 
             # bindgen needs libc headers
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+
+            # Use system libgit2 instead of bundled version to avoid conflicts with nix's libgit2
+            LIBGIT2_NO_VENDOR = "1";
 
             shellHook = ''
               echo "trix development shell"
@@ -74,6 +79,8 @@
 
             buildInputs = [
               pkgs.nix
+              # Use system libgit2 (same version as nix) to avoid conflicts
+              pkgs.libgit2
             ];
 
             # bindgen needs to find libclang
@@ -81,6 +88,9 @@
 
             # bindgen needs libc headers
             BINDGEN_EXTRA_CLANG_ARGS = "-isystem ${pkgs.glibc.dev}/include";
+
+            # Use system libgit2 instead of bundled version to avoid conflicts with nix's libgit2
+            LIBGIT2_NO_VENDOR = "1";
 
             # Tests require Nix store access which isn't available in sandbox
             doCheck = false;

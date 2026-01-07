@@ -8,7 +8,7 @@ use clap::Args;
 use tracing::{debug, info, instrument, trace};
 
 use crate::eval::Evaluator;
-use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
+use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
 use crate::progress;
 
 #[derive(Args)]
@@ -229,8 +229,18 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
     // Step 4: Initialize the evaluator and try each candidate
     let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
 
+    // Build flake URL for error messages
+    let canonical = flake_path
+        .canonicalize()
+        .unwrap_or_else(|_| flake_path.clone());
+    let is_git = git2::Repository::discover(flake_path).is_ok();
+    let flake_url = if is_git {
+        format!("git+file://{}", canonical.display())
+    } else {
+        format!("path:{}", canonical.display())
+    };
+
     let (attr_path, value) = {
-        let mut last_err = None;
         let mut found = None;
 
         for candidate in &candidates {
@@ -245,13 +255,12 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
                 }
                 Err(e) => {
                     trace!("candidate {} failed: {}", candidate.join("."), e);
-                    last_err = Some(e);
                 }
             }
         }
 
         found.ok_or_else(|| {
-            last_err.unwrap_or_else(|| anyhow::anyhow!("no candidates to try"))
+            anyhow!(format_attribute_not_found_error(&flake_url, &candidates))
         })?
     };
 

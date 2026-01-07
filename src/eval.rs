@@ -808,23 +808,27 @@ pub fn generate_flake_eval_expr(
     // Build the root inputs attrset
     // Use quoted attribute names to preserve hyphens (e.g., "flake-utils" = flake_utils)
     let mut input_attrs = Vec::new();
+    let mut resolved_root_inputs: Vec<(String, String)> = Vec::new();
     for (input_name, input_ref) in &root_inputs {
         let resolved_name = match input_ref {
             InputRef::Direct(name) => sanitize_name(name),
             InputRef::Follows(path) => {
                 // Follows at root level - resolve to the target
-                resolve_follows_to_name(path, lock)?
+                match resolve_follows_to_name(path, lock)? {
+                    FollowsResolution::Node(name) => name,
+                    FollowsResolution::Self_ => "self".to_string(),
+                }
             }
         };
         // Quote the attribute name to preserve hyphens
         input_attrs.push(format!("\"{}\" = {};", input_name, resolved_name));
+        resolved_root_inputs.push((input_name.clone(), resolved_name));
     }
 
     // Build the outputs call arguments
     // Must use original input names (with hyphens) as attribute names, mapped to sanitized variables
     let mut output_args = vec!["self = self".to_string()];
-    for input_name in root_inputs.keys() {
-        let sanitized = sanitize_name(input_name);
+    for (input_name, sanitized) in &resolved_root_inputs {
         // Quote the attribute name to preserve hyphens (e.g., "flake-utils" = flake_utils)
         output_args.push(format!("\"{}\" = {}", input_name, sanitized));
     }
@@ -844,15 +848,20 @@ pub fn generate_flake_eval_expr(
 let
   flakeDirPath = {flake_dir};
 
+  # Minimal self for nested inputs that follow root (defined before fetched sources)
+  # This is needed when a nested flake's input uses "follows": [] (empty follows = root self)
+  _rootSelf = {{
+    outPath = flakeDirPath;
+    _type = "flake";
+    {git_attrs}
+  }};
+
   # Fetched sources and built inputs
   {let_bindings}
 
-  # Self input (the local flake)
-  self = {{
-    outPath = flakeDirPath;
+  # Self input (the local flake) with full inputs
+  self = _rootSelf // {{
     inputs = {{ {input_attrs} }};
-    _type = "flake";
-    {git_attrs}
   }};
 
   # Import and evaluate the flake
@@ -949,9 +958,18 @@ fn generate_input_build_expr(
     for (input_name, input_ref) in &node.inputs {
         let resolved = match input_ref {
             InputRef::Direct(name) => sanitize_name(name),
-            InputRef::Follows(path) => resolve_follows_to_name(path, lock)?,
+            InputRef::Follows(path) => {
+                match resolve_follows_to_name(path, lock)? {
+                    FollowsResolution::Node(name) => name,
+                    // Empty follows at nested level means "follows root's self"
+                    // For nested inputs, this would be the root flake's self, but since
+                    // we're building this input before self is defined, we use _rootSelf
+                    FollowsResolution::Self_ => "_rootSelf".to_string(),
+                }
+            }
         };
-        input_exprs.push(format!("{} = {};", sanitize_name(input_name), resolved));
+        // Quote the attribute name to preserve hyphens (e.g., "nixpkgs-lib" = nixpkgs)
+        input_exprs.push(format!("\"{}\" = {};", input_name, resolved));
     }
 
     let inputs_str = input_exprs.join(" ");
@@ -1029,7 +1047,13 @@ fn topological_sort_nodes(lock: &FlakeLock) -> Result<Vec<String>> {
 }
 
 /// Resolve a follows path to a node name.
-fn resolve_follows_to_name(path: &[String], lock: &FlakeLock) -> Result<String> {
+/// Returns a special marker for empty follows (which means "follows self/root").
+fn resolve_follows_to_name(path: &[String], lock: &FlakeLock) -> Result<FollowsResolution> {
+    // Empty follows path means "follows self/root" - the input is the root flake itself
+    if path.is_empty() {
+        return Ok(FollowsResolution::Self_);
+    }
+
     // Simple follows resolution - just get the final target
     let mut current = lock.root.clone();
     for segment in path {
@@ -1043,7 +1067,15 @@ fn resolve_follows_to_name(path: &[String], lock: &FlakeLock) -> Result<String> 
             None => return Err(anyhow!("input '{}' not found in node '{}'", segment, current)),
         }
     }
-    Ok(sanitize_name(&current))
+    Ok(FollowsResolution::Node(sanitize_name(&current)))
+}
+
+/// Result of resolving a follows path.
+enum FollowsResolution {
+    /// Points to a named node (the sanitized variable name)
+    Node(String),
+    /// Points to self/root (empty follows path)
+    Self_,
 }
 
 /// Sanitize a name for use as a Nix identifier.

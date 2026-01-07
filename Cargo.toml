@@ -21,7 +21,9 @@ serde_json = "1"
 chrono = "0.4"
 
 # Git metadata (without copying to store)
-git2 = "0.18"
+# Use system libgit2 to avoid conflicts with Nix's libgit2
+# Version 0.20+ supports libgit2 1.9.x which matches nixpkgs
+git2 = "0.20"
 
 # Logging/tracing
 tracing = "0.1"

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::eval::Evaluator;
-use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
+use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
 use crate::progress;
 
 /// Manifest file structure (version 3)
@@ -379,9 +379,20 @@ pub fn install(installable: &str, priority: i32) -> Result<String> {
         let flake_path = resolved.path.as_ref().expect("local flake must have path");
         let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
 
+        // Compute flake URL early so we can use it in error messages
+        let canonical = flake_path
+            .canonicalize()
+            .unwrap_or_else(|_| flake_path.clone());
+        let is_git = git2::Repository::discover(flake_path).is_ok();
+
+        let flake_url = if is_git {
+            format!("git+file://{}", canonical.display())
+        } else {
+            format!("path:{}", canonical.display())
+        };
+
         // Try each candidate until one works (like build.rs does)
         let (attr_path, store_path) = {
-            let mut last_err = None;
             let mut found = None;
 
             for candidate in &candidates {
@@ -392,26 +403,13 @@ pub fn install(installable: &str, priority: i32) -> Result<String> {
                     }
                     Err(e) => {
                         debug!("candidate {} failed: {}", candidate.join("."), e);
-                        last_err = Some(e);
                     }
                 }
             }
 
             found.ok_or_else(|| {
-                last_err.unwrap_or_else(|| anyhow!("no candidates to try"))
+                anyhow!(format_attribute_not_found_error(&flake_url, &candidates))
             })?
-        };
-
-        // Use git+file:// for git repos, path: otherwise (matches nix behavior)
-        let canonical = flake_path
-            .canonicalize()
-            .unwrap_or_else(|_| flake_path.clone());
-        let is_git = git2::Repository::discover(flake_path).is_ok();
-
-        let flake_url = if is_git {
-            format!("git+file://{}", canonical.display())
-        } else {
-            format!("path:{}", canonical.display())
         };
 
         (store_path, attr_path.join("."), flake_url)

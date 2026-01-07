@@ -353,6 +353,10 @@ const PER_SYSTEM_CATEGORIES: &[&str] = &[
     "checks",
     "legacyPackages",
     "formatter",
+    // Legacy singular forms (deprecated but still used by some flakes)
+    "devShell",
+    "defaultPackage",
+    "defaultApp",
 ];
 
 /// Known output categories that are NOT per-system.
@@ -393,11 +397,42 @@ impl OperationContext {
         match self {
             OperationContext::Build => Some(&["packages", "legacyPackages"]),
             OperationContext::Run => Some(&["apps", "packages", "legacyPackages"]),
-            OperationContext::Develop => Some(&["devShells"]),
+            // nix develop fallback order: devShells, devShell (legacy), packages
+            OperationContext::Develop => Some(&["devShells", "devShell", "packages"]),
             OperationContext::Check => Some(&["checks"]),
             OperationContext::Eval => None,
         }
     }
+}
+
+/// Format an error message for when no candidate attribute was found.
+///
+/// Produces a message similar to nix's:
+/// "error: flake 'path' does not provide attribute 'a', 'b' or 'c'"
+pub fn format_attribute_not_found_error(
+    flake_url: &str,
+    candidates: &[Vec<String>],
+) -> String {
+    if candidates.is_empty() {
+        return format!("flake '{}' has no outputs", flake_url);
+    }
+
+    let attr_strs: Vec<String> = candidates
+        .iter()
+        .map(|c| format!("'{}'", c.join(".")))
+        .collect();
+
+    let attrs = if attr_strs.len() == 1 {
+        attr_strs[0].clone()
+    } else if attr_strs.len() == 2 {
+        format!("{} or {}", attr_strs[0], attr_strs[1])
+    } else {
+        // Join all but last with ", ", then add " or " + last
+        let (init, last) = attr_strs.split_at(attr_strs.len() - 1);
+        format!("{} or {}", init.join(", "), last[0])
+    };
+
+    format!("flake '{}' does not provide attribute {}", flake_url, attrs)
 }
 
 /// Check if a string looks like a Nix system identifier (e.g., "x86_64-linux").
@@ -454,11 +489,17 @@ pub fn expand_attribute(
     context: OperationContext,
     system: &str,
 ) -> Vec<Vec<String>> {
+    // Legacy singular categories don't have "default" suffix
+    let is_legacy_singular = |cat: &str| -> bool {
+        matches!(cat, "devShell" | "defaultPackage" | "defaultApp")
+    };
+
     // Helper to insert system into a per-system category path
     let insert_system = |category: &str, rest: &[String], add_default: bool| -> Vec<String> {
         let mut result = vec![category.to_string(), system.to_string()];
         result.extend(rest.iter().cloned());
-        if add_default && result.len() == 2 {
+        // Don't add "default" for legacy singular categories
+        if add_default && result.len() == 2 && !is_legacy_singular(category) {
             result.push("default".to_string());
         }
         result
@@ -497,7 +538,8 @@ pub fn expand_attribute(
         let path = if attr.len() >= 2 && looks_like_system(&attr[1]) {
             // Already has system
             let mut result = attr.to_vec();
-            if result.len() == 2 {
+            // Don't add "default" for legacy singular categories
+            if result.len() == 2 && !is_legacy_singular(first) {
                 result.push("default".to_string());
             }
             result
@@ -779,19 +821,29 @@ mod tests {
     // expand_attribute tests - Develop context
     #[test]
     fn expand_develop_empty() {
+        // nix develop tries: devShells.<system>.default, devShell.<system>, packages.<system>.default
         let candidates = expand_attribute(&[], OperationContext::Develop, "x86_64-linux");
-        assert_eq!(candidates, vec![vec!["devShells", "x86_64-linux", "default"]]);
+        assert_eq!(
+            candidates,
+            vec![
+                vec!["devShells", "x86_64-linux", "default"],
+                vec!["devShell", "x86_64-linux"],      // legacy singular (no .default)
+                vec!["packages", "x86_64-linux", "default"], // packages fallback
+            ]
+        );
     }
 
     #[test]
     fn expand_develop_single_name() {
-        // nix develop .#myshell tries: devShells.<system>.myshell, myshell
+        // nix develop .#myshell tries all categories with the name
         let candidates =
             expand_attribute(&["myshell".to_string()], OperationContext::Develop, "x86_64-linux");
         assert_eq!(
             candidates,
             vec![
                 vec!["devShells", "x86_64-linux", "myshell"],
+                vec!["devShell", "x86_64-linux", "myshell"], // legacy singular tries with name too
+                vec!["packages", "x86_64-linux", "myshell"],
                 vec!["myshell"], // bare attribute fallback
             ]
         );
@@ -860,5 +912,55 @@ mod tests {
             "x86_64-linux",
         );
         assert_eq!(candidates, vec![vec!["overlays", "default"]]);
+    }
+
+    // format_attribute_not_found_error tests
+    #[test]
+    fn format_error_single_candidate() {
+        let msg = format_attribute_not_found_error(
+            "git+file:///home/user/flake",
+            &[vec!["packages".to_string(), "x86_64-linux".to_string(), "hello".to_string()]],
+        );
+        assert_eq!(
+            msg,
+            "flake 'git+file:///home/user/flake' does not provide attribute 'packages.x86_64-linux.hello'"
+        );
+    }
+
+    #[test]
+    fn format_error_two_candidates() {
+        let msg = format_attribute_not_found_error(
+            "path:/some/path",
+            &[
+                vec!["packages".to_string(), "x86_64-linux".to_string(), "foo".to_string()],
+                vec!["legacyPackages".to_string(), "x86_64-linux".to_string(), "foo".to_string()],
+            ],
+        );
+        assert_eq!(
+            msg,
+            "flake 'path:/some/path' does not provide attribute 'packages.x86_64-linux.foo' or 'legacyPackages.x86_64-linux.foo'"
+        );
+    }
+
+    #[test]
+    fn format_error_three_candidates() {
+        let msg = format_attribute_not_found_error(
+            "git+file:///home/nixpkgs",
+            &[
+                vec!["packages".to_string(), "x86_64-linux".to_string(), "bar".to_string()],
+                vec!["legacyPackages".to_string(), "x86_64-linux".to_string(), "bar".to_string()],
+                vec!["bar".to_string()],
+            ],
+        );
+        assert_eq!(
+            msg,
+            "flake 'git+file:///home/nixpkgs' does not provide attribute 'packages.x86_64-linux.bar', 'legacyPackages.x86_64-linux.bar' or 'bar'"
+        );
+    }
+
+    #[test]
+    fn format_error_empty_candidates() {
+        let msg = format_attribute_not_found_error("path:/foo", &[]);
+        assert_eq!(msg, "flake 'path:/foo' has no outputs");
     }
 }

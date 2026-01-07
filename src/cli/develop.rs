@@ -187,22 +187,54 @@ fn run_flake_mode(args: &DevelopArgs) -> Result<()> {
     // Step 2: Determine the full attribute path for devShells
     let system = current_system()?;
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Develop, &system);
-    let attr_path = &candidates[0]; // Develop only has one candidate (devShells)
-    debug!(attr = %attr_path.join("."), %system, "expanded attribute path");
+    debug!(candidates = ?candidates, %system, "expanded attribute candidates");
 
     // Step 3: Evaluate the devShell to get drvPath using native evaluation
-    let eval_target = format!("{}#{}", flake_path.display(), attr_path.join("."));
-    info!("evaluating {}", eval_target);
-
-    let status = progress::evaluating(&eval_target);
-
+    // Try each candidate in order until one succeeds (fallback order: devShells, devShell, packages)
     let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-    let value = eval
-        .eval_flake_attr(&flake_path, attr_path)
-        .context("failed to evaluate devShell")?;
-    let drv_path_str = eval.get_drv_path(&value)?;
+    let mut last_error = None;
+    let mut drv_path_str = None;
+    let mut successful_attr = None;
 
-    status.finish_and_clear();
+    for attr_path in &candidates {
+        let eval_target = format!("{}#{}", flake_path.display(), attr_path.join("."));
+        debug!(attr = %attr_path.join("."), "trying candidate");
+
+        let status = progress::evaluating(&eval_target);
+        match eval.eval_flake_attr(&flake_path, attr_path) {
+            Ok(value) => {
+                match eval.get_drv_path(&value) {
+                    Ok(path) => {
+                        status.finish_and_clear();
+                        drv_path_str = Some(path);
+                        successful_attr = Some(attr_path.join("."));
+                        break;
+                    }
+                    Err(e) => {
+                        status.finish_and_clear();
+                        debug!(attr = %attr_path.join("."), error = %e, "candidate not a derivation");
+                        last_error = Some(e);
+                    }
+                }
+            }
+            Err(e) => {
+                status.finish_and_clear();
+                debug!(attr = %attr_path.join("."), error = %e, "candidate not found");
+                last_error = Some(e);
+            }
+        }
+    }
+
+    let drv_path_str = match drv_path_str {
+        Some(path) => path,
+        None => {
+            return Err(last_error
+                .unwrap_or_else(|| anyhow!("no devShell found"))
+                .context("failed to evaluate devShell"));
+        }
+    };
+
+    info!("evaluating {}#{}", flake_path.display(), successful_attr.unwrap_or_default());
     debug!(drv = %drv_path_str, "got derivation path");
 
     // Step 5: Enter the dev shell using nix-shell
