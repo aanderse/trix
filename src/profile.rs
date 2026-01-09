@@ -177,34 +177,74 @@ pub fn get_next_profile_number_for(profile: Option<&Path>) -> Result<u32> {
     Ok(max_gen + 1)
 }
 
-/// Collect all files/dirs from packages that need to be symlinked in the profile.
-pub fn collect_package_paths(store_paths: &[String]) -> Result<HashMap<String, Vec<PathBuf>>> {
-    let mut result: HashMap<String, Vec<PathBuf>> = HashMap::new();
+/// Entry for a package path with its priority.
+#[derive(Debug)]
+struct PrioritizedPath {
+    path: PathBuf,
+    priority: i32,
+}
 
-    for store_path in store_paths {
-        let path = Path::new(store_path);
-        if !path.exists() {
+/// Collect all files/dirs from packages that need to be symlinked in the profile.
+/// Each entry includes the priority from the manifest for conflict resolution.
+fn collect_package_paths_with_priority(
+    manifest: &Manifest,
+) -> Result<HashMap<String, Vec<PrioritizedPath>>> {
+    let mut result: HashMap<String, Vec<PrioritizedPath>> = HashMap::new();
+
+    // Build a map from store path to priority
+    let mut store_path_priorities: HashMap<&str, i32> = HashMap::new();
+    for element in manifest.elements.values() {
+        if element.active {
+            for sp in &element.store_paths {
+                store_path_priorities.insert(sp.as_str(), element.priority);
+            }
+        }
+    }
+
+    // Collect paths from all active elements
+    for element in manifest.elements.values() {
+        if !element.active {
             continue;
         }
 
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().to_string();
-
-            // Skip manifest.json and nix-support
-            if name == "manifest.json" || name == "nix-support" {
+        for store_path in &element.store_paths {
+            let path = Path::new(store_path);
+            if !path.exists() {
                 continue;
             }
 
-            result.entry(name).or_default().push(entry.path());
+            let priority = store_path_priorities
+                .get(store_path.as_str())
+                .copied()
+                .unwrap_or(5);
+
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().to_string();
+
+                // Skip manifest.json and nix-support
+                if name == "manifest.json" || name == "nix-support" {
+                    continue;
+                }
+
+                result.entry(name).or_default().push(PrioritizedPath {
+                    path: entry.path(),
+                    priority,
+                });
+            }
         }
+    }
+
+    // Sort each entry by priority (lower priority number wins)
+    for paths in result.values_mut() {
+        paths.sort_by_key(|p| p.priority);
     }
 
     Ok(result)
 }
 
 /// Create a new profile store path with the given manifest and packages.
-pub fn create_profile_store_path(manifest: &Manifest, store_paths: &[String]) -> Result<String> {
+pub fn create_profile_store_path(manifest: &Manifest, _store_paths: &[String]) -> Result<String> {
     // Create a temporary directory for the profile
     // Use /tmp explicitly to avoid issues with TMPDIR pointing to a nix-shell temp dir
     let temp_parent = tempfile::tempdir_in("/tmp")?;
@@ -215,26 +255,39 @@ pub fn create_profile_store_path(manifest: &Manifest, store_paths: &[String]) ->
     let manifest_content = serde_json::to_string_pretty(manifest)?;
     fs::write(profile_dir.join("manifest.json"), manifest_content)?;
 
-    // Collect and symlink package contents
-    let package_paths = collect_package_paths(store_paths)?;
+    // Collect and symlink package contents, respecting priorities
+    // Lower priority numbers win in case of conflicts (like nix profile)
+    let package_paths = collect_package_paths_with_priority(manifest)?;
 
     for (name, targets) in package_paths {
         let dest = profile_dir.join(&name);
 
         if targets.len() == 1 {
             // Simple symlink
-            symlink(&targets[0], &dest)?;
+            symlink(&targets[0].path, &dest)?;
         } else {
-            // Need to merge directories
-            fs::create_dir_all(&dest)?;
-            for target in &targets {
-                if target.is_dir() {
-                    for entry in fs::read_dir(target)? {
-                        let entry = entry?;
-                        let entry_name = entry.file_name();
-                        let entry_dest = dest.join(&entry_name);
-                        if !entry_dest.exists() {
-                            symlink(entry.path(), &entry_dest)?;
+            // Check if any target is not a directory - if so, use highest priority (first)
+            let all_dirs = targets.iter().all(|t| t.path.is_dir());
+
+            if !all_dirs {
+                // Not all are directories - symlink to the highest priority one
+                // (targets are already sorted by priority, so first wins)
+                symlink(&targets[0].path, &dest)?;
+            } else {
+                // All are directories - merge them, with priority determining winner for conflicts
+                fs::create_dir_all(&dest)?;
+
+                // Process in priority order (already sorted), first entry wins
+                for target in &targets {
+                    if target.path.is_dir() {
+                        for entry in fs::read_dir(&target.path)? {
+                            let entry = entry?;
+                            let entry_name = entry.file_name();
+                            let entry_dest = dest.join(&entry_name);
+                            if !entry_dest.exists() {
+                                // First (highest priority) wins
+                                symlink(entry.path(), &entry_dest)?;
+                            }
                         }
                     }
                 }
@@ -366,7 +419,7 @@ fn build_package(flake_dir: &Path, attr_path: &[String]) -> Result<String> {
 }
 
 /// Install a package to the profile.
-pub fn install(installable: &str, priority: i32) -> Result<String> {
+pub fn install(installable: &str, priority: i32, refresh: bool) -> Result<String> {
     let system = current_system()?;
     let cwd = std::env::current_dir().context("failed to get current directory")?;
 
@@ -432,10 +485,14 @@ pub fn install(installable: &str, priority: i32) -> Result<String> {
 
         let build_status = progress::building(&flake_ref);
 
-        let output = Command::new("nix")
-            .args(["build", "--no-link", "--print-out-paths", &flake_ref])
-            .output()
-            .context("failed to run nix build")?;
+        let mut cmd = Command::new("nix");
+        cmd.args(["build", "--no-link", "--print-out-paths"]);
+        if refresh {
+            cmd.arg("--refresh");
+        }
+        cmd.arg(&flake_ref);
+
+        let output = cmd.output().context("failed to run nix build")?;
 
         build_status.finish_and_clear();
 
@@ -577,8 +634,8 @@ pub fn remove(name: &str) -> Result<bool> {
     Ok(true)
 }
 
-/// Upgrade local packages in profile.
-pub fn upgrade(name: Option<&str>) -> Result<(u32, u32)> {
+/// Upgrade packages in profile (both local and remote).
+pub fn upgrade(name: Option<&str>, refresh: bool) -> Result<(u32, u32)> {
     let manifest = get_current_manifest()?;
     let system = current_system()?;
 
@@ -600,62 +657,103 @@ pub fn upgrade(name: Option<&str>) -> Result<(u32, u32)> {
             }
         }
 
-        // Check if this is a local path we can upgrade
+        // Check if this is a local path we can upgrade natively
         let local_path = match &element.original_url {
             Some(url) => extract_local_path(url),
             None => None,
         };
 
-        let path = match local_path {
-            Some(p) if !p.starts_with("/nix/store") => p,
-            _ => {
-                // Not a local path or is a store path - can't upgrade
-                if name.is_some() {
+        let old_path = element
+            .store_paths
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        match local_path {
+            Some(path) if !path.starts_with("/nix/store") => {
+                // Local flake - upgrade natively
+                let flake_dir = PathBuf::from(&path);
+
+                if !flake_dir.exists() {
+                    eprintln!("warning: flake directory not found: {}", path);
                     skipped += 1;
+                    continue;
                 }
-                continue;
+
+                // Build the attribute path
+                let candidates = expand_attribute(
+                    &attr.split('.').map(|s| s.to_string()).collect::<Vec<_>>(),
+                    OperationContext::Build,
+                    &system,
+                );
+                let attr_path = &candidates[0];
+
+                match build_package(&flake_dir, attr_path) {
+                    Ok(new_path) => {
+                        if new_path != old_path {
+                            debug!("upgrading {}: {} -> {}", pkg_name, old_path, new_path);
+
+                            // Re-install with new store path (refresh doesn't matter for local)
+                            let installable = format!("{}#{}", path, attr);
+                            install(&installable, element.priority, false)?;
+
+                            upgraded += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("warning: failed to build {}: {}", pkg_name, e);
+                        skipped += 1;
+                    }
+                }
             }
-        };
+            _ => {
+                // Remote flake - upgrade via nix build
+                let original_url = match &element.original_url {
+                    Some(url) => url,
+                    None => {
+                        debug!("skipping {} - no original_url", elem_name);
+                        skipped += 1;
+                        continue;
+                    }
+                };
 
-        let flake_dir = PathBuf::from(path);
+                // Build the flake reference for nix build
+                let flake_ref = format!("{}#{}", original_url, attr);
+                info!("upgrading remote package: {}", flake_ref);
 
-        if !flake_dir.exists() {
-            eprintln!("warning: flake directory not found: {}", path);
-            skipped += 1;
-            continue;
-        }
+                let build_status = progress::building(&flake_ref);
 
-        // Build the attribute path
-        let candidates = expand_attribute(
-            &attr.split('.').map(|s| s.to_string()).collect::<Vec<_>>(),
-            OperationContext::Build,
-            &system,
-        );
-        let attr_path = &candidates[0];
+                let mut cmd = Command::new("nix");
+                cmd.args(["build", "--no-link", "--print-out-paths"]);
+                if refresh {
+                    cmd.arg("--refresh");
+                }
+                cmd.arg(&flake_ref);
 
-        match build_package(&flake_dir, attr_path) {
-            Ok(new_path) => {
-                let old_path = element
-                    .store_paths
-                    .first()
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
+                let output = cmd.output().context("failed to run nix build")?;
+
+                build_status.finish_and_clear();
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!("warning: failed to build {}: {}", pkg_name, stderr.trim());
+                    skipped += 1;
+                    continue;
+                }
+
+                let new_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
                 if new_path != old_path {
                     debug!("upgrading {}: {} -> {}", pkg_name, old_path, new_path);
 
                     // Re-install with new store path
-                    let installable = format!("{}#{}", path, attr);
-                    install(&installable, element.priority)?;
-
+                    install(&flake_ref, element.priority, refresh)?;
                     upgraded += 1;
                 } else {
                     skipped += 1;
                 }
-            }
-            Err(e) => {
-                eprintln!("warning: failed to build {}: {}", pkg_name, e);
-                skipped += 1;
             }
         }
     }

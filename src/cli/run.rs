@@ -18,6 +18,10 @@ pub struct RunArgs {
     #[arg(default_value = ".#default")]
     pub installable: String,
 
+    /// Accepted for nix CLI compatibility (trix is always impure)
+    #[arg(long, hide = true)]
+    pub impure: bool,
+
     /// Arguments to pass to the program
     #[arg(last = true)]
     pub program_args: Vec<String>,

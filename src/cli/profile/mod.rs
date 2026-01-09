@@ -47,6 +47,10 @@ enum ProfileCommand {
         /// Priority for conflict resolution (lower = higher priority)
         #[arg(long, default_value = "5")]
         priority: i32,
+
+        /// Consider all previously downloaded files out-of-date
+        #[arg(long)]
+        refresh: bool,
     },
     /// Alias for 'add'
     Install {
@@ -57,6 +61,10 @@ enum ProfileCommand {
         /// Priority for conflict resolution
         #[arg(long, default_value = "5")]
         priority: i32,
+
+        /// Consider all previously downloaded files out-of-date
+        #[arg(long)]
+        refresh: bool,
     },
     /// Remove packages from a profile
     Remove {
@@ -66,8 +74,12 @@ enum ProfileCommand {
     },
     /// Upgrade packages using their most recent flake
     Upgrade {
-        /// Specific package to upgrade (upgrades all local packages if omitted)
+        /// Specific package to upgrade (upgrades all packages if omitted)
         package: Option<String>,
+
+        /// Consider all previously downloaded files out-of-date
+        #[arg(long)]
+        refresh: bool,
     },
     /// Show all versions of a profile
     History,
@@ -98,13 +110,15 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         ProfileCommand::Add {
             installables,
             priority,
+            refresh,
         }
         | ProfileCommand::Install {
             installables,
             priority,
-        } => run_add(&installables, priority, profile),
+            refresh,
+        } => run_add(&installables, priority, refresh, profile),
         ProfileCommand::Remove { packages } => run_remove(&packages, profile),
-        ProfileCommand::Upgrade { package } => run_upgrade(package.as_deref(), profile),
+        ProfileCommand::Upgrade { package, refresh } => run_upgrade(package.as_deref(), refresh, profile),
         ProfileCommand::History => run_history(profile),
         ProfileCommand::Rollback { to } => run_rollback(to, profile),
         ProfileCommand::WipeHistory {
@@ -164,12 +178,12 @@ fn run_list(output_json: bool, profile: Option<&std::path::Path>) -> Result<()> 
     Ok(())
 }
 
-fn run_add(installables: &[String], priority: i32, _profile: Option<&std::path::Path>) -> Result<()> {
+fn run_add(installables: &[String], priority: i32, refresh: bool, _profile: Option<&std::path::Path>) -> Result<()> {
     // TODO: Pass profile to install function when profile::install_for is implemented
     for installable in installables {
         debug!("installing {}...", installable);
 
-        let pkg_name = profile::install(installable, priority)?;
+        let pkg_name = profile::install(installable, priority, refresh)?;
         println!("Added {}", pkg_name);
     }
 
@@ -189,16 +203,16 @@ fn run_remove(packages: &[String], _profile: Option<&std::path::Path>) -> Result
     Ok(())
 }
 
-fn run_upgrade(name: Option<&str>, _profile: Option<&std::path::Path>) -> Result<()> {
+fn run_upgrade(name: Option<&str>, refresh: bool, _profile: Option<&std::path::Path>) -> Result<()> {
     // TODO: Pass profile to upgrade function when profile::upgrade_for is implemented
-    let (upgraded, skipped) = profile::upgrade(name)?;
+    let (upgraded, skipped) = profile::upgrade(name, refresh)?;
 
     if upgraded > 0 {
         println!("Upgraded {} package(s)", upgraded);
     } else if skipped > 0 {
         println!("All {} package(s) up to date", skipped);
     } else {
-        println!("No local packages to upgrade");
+        println!("No packages to upgrade");
     }
 
     Ok(())

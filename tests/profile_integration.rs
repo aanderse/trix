@@ -437,3 +437,292 @@ fn test_profile_install_alias_with_registry_flake() {
         }
     }
 }
+
+// =============================================================================
+// Tests for priority-based conflict resolution
+// =============================================================================
+
+/// Helper to create a test flake that produces a package with a specific binary.
+/// The package_name will be used for the derivation name, and the binary will contain an identifier.
+fn create_test_flake_with_binary(dir: &Path, package_name: &str, binary_name: &str, identifier: &str) {
+    // Write a flake that creates a package with a bin directory
+    // Use runCommand to create a proper derivation with a custom name
+    fs::write(
+        dir.join("flake.nix"),
+        format!(
+            r#"{{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  outputs = {{ self, nixpkgs }}: let
+    systems = [ "x86_64-linux" "aarch64-linux" ];
+    forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
+  in {{
+    packages = forAllSystems (system: let
+      pkgs = nixpkgs.legacyPackages.${{system}};
+    in {{
+      default = pkgs.runCommand "{package_name}" {{}} ''
+        mkdir -p $out/bin
+        echo '#!/bin/sh' > $out/bin/{binary_name}
+        echo 'echo {identifier}' >> $out/bin/{binary_name}
+        chmod +x $out/bin/{binary_name}
+      '';
+    }});
+  }};
+}}"#
+        ),
+    )
+    .unwrap();
+
+    // Initialize git repo (required for flakes)
+    let dir_str = dir.to_str().unwrap();
+    let _ = Command::new("git")
+        .args(["init", "--quiet", dir_str])
+        .output();
+    let _ = Command::new("git")
+        .args(["-C", dir_str, "config", "user.email", "test@test.com"])
+        .output();
+    let _ = Command::new("git")
+        .args(["-C", dir_str, "config", "user.name", "Test"])
+        .output();
+    let _ = Command::new("git")
+        .args(["-C", dir_str, "add", "flake.nix"])
+        .output();
+    let _ = Command::new("git")
+        .args(["-C", dir_str, "commit", "-m", "init", "--quiet"])
+        .output();
+    // Generate lock file
+    let _ = Command::new("nix")
+        .args(["flake", "lock", dir_str])
+        .output();
+    let _ = Command::new("git")
+        .args(["-C", dir_str, "add", "flake.lock"])
+        .output();
+    let _ = Command::new("git")
+        .args(["-C", dir_str, "commit", "-m", "add lock", "--quiet", "--allow-empty"])
+        .output();
+}
+
+/// Test that priority-based conflict resolution works correctly.
+/// Lower priority numbers should win (take precedence) for conflicting files.
+#[test]
+#[ignore] // Slow: requires nixpkgs download
+fn test_profile_priority_conflict_resolution() {
+    // Use a unique isolated home directory with proper profile setup
+    let home = tempfile::TempDir::new().unwrap();
+    let home_path = home.path().to_str().unwrap();
+
+    // Create two test flakes that both provide a binary named "conflict-test"
+    // but with different package names (which will appear in the store path)
+    let flake_dir_a = tempfile::TempDir::new().unwrap();
+    create_test_flake_with_binary(
+        flake_dir_a.path(),
+        "priority-pkg-a",  // package name (in store path)
+        "conflict-test",   // binary name
+        "pkg-a",           // identifier in output
+    );
+
+    let flake_dir_b = tempfile::TempDir::new().unwrap();
+    create_test_flake_with_binary(
+        flake_dir_b.path(),
+        "priority-pkg-b",  // package name (in store path)
+        "conflict-test",   // binary name
+        "pkg-b",           // identifier in output
+    );
+
+    // Set up profile directory structure in the temp home
+    // trix uses ~/.nix-profile which points to profile-N-link in ~/.local/state/nix/profiles
+    let profile_state_dir = home.path().join(".local/state/nix/profiles");
+    fs::create_dir_all(&profile_state_dir).unwrap();
+
+    // Helper to run trix profile commands with isolated HOME
+    let run_profile = |args: &[&str]| -> Result<String, String> {
+        let mut full_args = vec!["profile"];
+        full_args.extend(args);
+        trix_with_home(home_path, &full_args)
+    };
+
+    // First, add pkg-a with default priority (5)
+    let add_a = run_profile(&["add", flake_dir_a.path().to_str().unwrap()]);
+    assert!(add_a.is_ok(), "failed to add pkg-a: {:?}", add_a);
+
+    // Then add pkg-b with higher priority (lower number = wins)
+    let add_b = run_profile(&[
+        "add",
+        "--priority",
+        "1",
+        flake_dir_b.path().to_str().unwrap(),
+    ]);
+    assert!(add_b.is_ok(), "failed to add pkg-b: {:?}", add_b);
+
+    // The profile link should now exist at ~/.nix-profile
+    let profile_link = home.path().join(".nix-profile");
+    let profile_target = fs::read_link(&profile_link);
+    assert!(profile_target.is_ok(), "profile link should exist at {:?}", profile_link);
+
+    let profile_store_path = profile_target.unwrap();
+    let binary_path = profile_store_path.join("bin/conflict-test");
+
+    if binary_path.exists() {
+        // The binary could be:
+        // 1. A direct symlink to the store path binary
+        // 2. Inside a bin directory that is a symlink
+        // 3. A regular file (unlikely)
+        let target_str = if binary_path.is_symlink() {
+            // Direct symlink to the binary
+            fs::read_link(&binary_path)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        } else {
+            // The file itself - check parent bin dir
+            let bin_dir = binary_path.parent().unwrap();
+            if bin_dir.is_symlink() {
+                // bin dir is symlinked to a package's bin
+                fs::read_link(bin_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                // Read the actual file content to check which package it came from
+                fs::read_to_string(&binary_path).unwrap_or_default()
+            }
+        };
+
+        // pkg-b should win because it has priority 1 (lower than pkg-a's 5)
+        assert!(
+            target_str.contains("pkg-b"),
+            "pkg-b (priority 1) should win over pkg-a (priority 5), but got: {}",
+            target_str
+        );
+    }
+
+    // Verify both packages are listed in the profile
+    let list_result = run_profile(&["list", "--json"]);
+    assert!(list_result.is_ok(), "profile list failed: {:?}", list_result);
+
+    let list_output = list_result.unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&list_output).unwrap();
+
+    // Should have 2 packages
+    let elements = manifest.as_array().unwrap();
+    assert_eq!(
+        elements.len(),
+        2,
+        "should have 2 packages installed: {:?}",
+        elements
+    );
+}
+
+/// Test that reinstalling a package with a different priority updates the conflict resolution.
+#[test]
+#[ignore] // Slow: requires nixpkgs download
+fn test_profile_priority_update_on_reinstall() {
+    // Use isolated home directory
+    let home = tempfile::TempDir::new().unwrap();
+    let home_path = home.path().to_str().unwrap();
+
+    // Create two test flakes with conflicting binaries
+    let flake_dir_a = tempfile::TempDir::new().unwrap();
+    create_test_flake_with_binary(
+        flake_dir_a.path(),
+        "update-priority-pkg-a",  // package name
+        "update-conflict",        // binary name
+        "update-a",               // identifier
+    );
+
+    let flake_dir_b = tempfile::TempDir::new().unwrap();
+    create_test_flake_with_binary(
+        flake_dir_b.path(),
+        "update-priority-pkg-b",  // package name
+        "update-conflict",        // binary name
+        "update-b",               // identifier
+    );
+
+    // Set up profile directory structure
+    let profile_state_dir = home.path().join(".local/state/nix/profiles");
+    fs::create_dir_all(&profile_state_dir).unwrap();
+
+    let run_profile = |args: &[&str]| -> Result<String, String> {
+        let mut full_args = vec!["profile"];
+        full_args.extend(args);
+        trix_with_home(home_path, &full_args)
+    };
+
+    // Add pkg-a with priority 1 (wins)
+    let add_a = run_profile(&[
+        "add",
+        "--priority",
+        "1",
+        flake_dir_a.path().to_str().unwrap(),
+    ]);
+    assert!(add_a.is_ok(), "failed to add pkg-a: {:?}", add_a);
+
+    // Add pkg-b with priority 10 (loses)
+    let add_b = run_profile(&[
+        "add",
+        "--priority",
+        "10",
+        flake_dir_b.path().to_str().unwrap(),
+    ]);
+    assert!(add_b.is_ok(), "failed to add pkg-b: {:?}", add_b);
+
+    // Helper to get winning package from binary path
+    let get_winner = |binary_path: &Path| -> String {
+        if binary_path.is_symlink() {
+            fs::read_link(binary_path)
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        } else {
+            let bin_dir = binary_path.parent().unwrap();
+            if bin_dir.is_symlink() {
+                fs::read_link(bin_dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                fs::read_to_string(binary_path).unwrap_or_default()
+            }
+        }
+    };
+
+    // Check that pkg-a wins initially
+    let profile_link = home.path().join(".nix-profile");
+    let profile_target = fs::read_link(&profile_link).unwrap();
+    let binary_path = profile_target.join("bin/update-conflict");
+
+    if binary_path.exists() {
+        let target_str = get_winner(&binary_path);
+        assert!(
+            target_str.contains("update-priority-pkg-a"),
+            "pkg-a (priority 1) should win initially: {}",
+            target_str
+        );
+    }
+
+    // Now reinstall pkg-b with priority 0 (should now win)
+    // First remove it
+    let remove_b = run_profile(&["remove", "update-priority-pkg-b"]);
+    assert!(remove_b.is_ok(), "failed to remove pkg-b: {:?}", remove_b);
+
+    // Re-add with higher priority (lower number)
+    let readd_b = run_profile(&[
+        "add",
+        "--priority",
+        "0",
+        flake_dir_b.path().to_str().unwrap(),
+    ]);
+    assert!(readd_b.is_ok(), "failed to re-add pkg-b: {:?}", readd_b);
+
+    // Check that pkg-b now wins
+    let profile_target = fs::read_link(&profile_link).unwrap();
+    let binary_path = profile_target.join("bin/update-conflict");
+
+    if binary_path.exists() {
+        let target_str = get_winner(&binary_path);
+        assert!(
+            target_str.contains("update-priority-pkg-b"),
+            "pkg-b (priority 0) should win after reinstall: {}",
+            target_str
+        );
+    }
+}

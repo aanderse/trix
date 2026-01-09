@@ -17,6 +17,10 @@ pub struct BuildArgs {
     #[arg(default_value = ".#default")]
     pub installable: String,
 
+    /// Accepted for nix CLI compatibility (trix is always impure)
+    #[arg(long, hide = true)]
+    pub impure: bool,
+
     /// Build from a Nix file instead of a flake
     #[arg(short = 'f', long = "file", conflicts_with = "installable")]
     pub file: Option<PathBuf>,

@@ -17,6 +17,10 @@ pub struct EvalArgs {
     #[arg(default_value = ".")]
     pub installable: String,
 
+    /// Accepted for nix CLI compatibility (trix is always impure)
+    #[arg(long, hide = true)]
+    pub impure: bool,
+
     /// Interpret installable as attribute path relative to the Nix expression
     #[arg(long, value_name = "EXPR", allow_hyphen_values = true)]
     pub expr: Option<String>,

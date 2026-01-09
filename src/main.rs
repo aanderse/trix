@@ -77,6 +77,7 @@ fn main() {
     // Check for shebang mode before normal CLI parsing
     let (cli, shebang_info) = if let Some(shebang_script) = shebang::detect_shebang(&args) {
         // Build the argument list for shebang mode
+        // Like nix, we append the script path and args to --command
         let mut new_args = vec![args[0].clone()];
 
         // Add global flags (like -v) first
@@ -85,14 +86,14 @@ fn main() {
         // Add the directive arguments
         new_args.extend(shebang_script.args.clone());
 
-        // Add hidden arguments for script path and script arguments
-        new_args.push("--script".to_string());
+        // Append script path and script arguments to the command
+        // This matches nix shebang behavior: --command interpreter becomes
+        // --command interpreter /script/path arg1 arg2
         new_args.push(shebang_script.script_path.clone());
 
         // Add script arguments (everything after the script path in original args)
         let script_args_start = shebang_script.script_index + 1;
         if args.len() > script_args_start {
-            new_args.push("--script-args".to_string());
             new_args.extend(args[script_args_start..].iter().cloned());
         }
 

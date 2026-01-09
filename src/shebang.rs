@@ -1,14 +1,17 @@
 //! Shebang script support.
 //!
-//! Allows trix to be used as a script interpreter, similar to nix-shell.
+//! Allows trix to be used as a script interpreter, compatible with nix's shebang style.
 //!
-//! Example script:
+//! Example script (same syntax as nix):
 //! ```bash
 //! #!/usr/bin/env trix
-//! #!trix develop -i python3 .#devShell
+//! #!trix develop .#devShell --command python3
 //!
 //! print("Hello from Python!")
 //! ```
+//!
+//! The script path and any additional arguments are automatically appended to the command,
+//! so the above becomes: `trix develop .#devShell --command python3 /path/to/script arg1 arg2`
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -213,8 +216,8 @@ mod tests {
     #[test]
     fn test_parse_args_simple() {
         assert_eq!(
-            parse_args("develop -i python3"),
-            vec!["develop", "-i", "python3"]
+            parse_args("develop . --command python3"),
+            vec!["develop", ".", "--command", "python3"]
         );
     }
 
@@ -240,14 +243,13 @@ mod tests {
     fn test_parse_shebang_directives() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "#!/usr/bin/env trix").unwrap();
-        writeln!(file, "#!trix develop -i python3").unwrap();
-        writeln!(file, "#!trix --pure").unwrap();
+        writeln!(file, "#!trix develop . --command python3").unwrap();
         writeln!(file, "").unwrap();
         writeln!(file, "print('hello')").unwrap();
         file.flush().unwrap();
 
         let args = parse_shebang_directives(file.path()).unwrap();
-        assert_eq!(args, vec!["develop", "-i", "python3", "--pure"]);
+        assert_eq!(args, vec!["develop", ".", "--command", "python3"]);
     }
 
     #[test]
@@ -276,7 +278,7 @@ mod tests {
     fn test_detect_shebang_with_script() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "#!/usr/bin/env trix").unwrap();
-        writeln!(file, "#!trix develop -i bash").unwrap();
+        writeln!(file, "#!trix develop . --command bash").unwrap();
         file.flush().unwrap();
 
         let args = vec![
@@ -286,7 +288,7 @@ mod tests {
         let result = detect_shebang(&args);
         assert!(result.is_some());
         let shebang = result.unwrap();
-        assert_eq!(shebang.args, vec!["develop", "-i", "bash"]);
+        assert_eq!(shebang.args, vec!["develop", ".", "--command", "bash"]);
     }
 
     #[test]
@@ -299,7 +301,7 @@ mod tests {
     fn test_detect_shebang_with_global_flag() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, "#!/usr/bin/env trix").unwrap();
-        writeln!(file, "#!trix develop -i bash").unwrap();
+        writeln!(file, "#!trix develop . --command bash").unwrap();
         file.flush().unwrap();
 
         let args = vec![
@@ -311,7 +313,7 @@ mod tests {
         let result = detect_shebang(&args);
         assert!(result.is_some());
         let shebang = result.unwrap();
-        assert_eq!(shebang.args, vec!["develop", "-i", "bash"]);
+        assert_eq!(shebang.args, vec!["develop", ".", "--command", "bash"]);
         assert_eq!(shebang.global_args, vec!["-v"]);
         assert_eq!(shebang.script_index, 2);
     }

@@ -21,6 +21,10 @@ use crate::lock::FlakeLock;
 pub struct ReplArgs {
     /// Flake reference to load (optional)
     pub flake_ref: Option<String>,
+
+    /// Accepted for nix CLI compatibility (trix is always impure)
+    #[arg(long, hide = true)]
+    pub impure: bool,
 }
 
 #[instrument(level = "debug", skip_all)]

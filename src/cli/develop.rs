@@ -17,6 +17,10 @@ pub struct DevelopArgs {
     #[arg(default_value = ".")]
     pub installable: String,
 
+    /// Accepted for nix CLI compatibility (trix is always impure)
+    #[arg(long, hide = true)]
+    pub impure: bool,
+
     /// Enter shell from a Nix file instead of a flake (like nix-shell)
     #[arg(short = 'f', long = "file", conflicts_with = "installable")]
     pub file: Option<PathBuf>,
@@ -35,39 +39,25 @@ pub struct DevelopArgs {
     #[arg(long = "argstr", num_args = 2, value_names = ["NAME", "VALUE"], action = clap::ArgAction::Append, requires = "file")]
     pub argstr: Vec<String>,
 
-    /// Command to run instead of interactive shell
-    #[arg(short = 'c', long)]
-    pub command: Option<String>,
+    /// Command and arguments to run instead of interactive shell
+    #[arg(short = 'c', long = "command", num_args = 1.., allow_hyphen_values = true)]
+    pub command: Vec<String>,
 
-    /// Interpreter for shebang scripts (e.g., python3, bash)
-    #[arg(short = 'i', long = "interpreter")]
-    pub interpreter: Option<String>,
+    /// Clear the entire environment, except for those specified with --keep-env-var
+    #[arg(short = 'i', long = "ignore-env")]
+    pub ignore_env: bool,
 
-    /// Script file to run with the interpreter (used in shebang mode)
-    #[arg(long = "script", hide = true)]
-    pub script: Option<String>,
+    /// Keep the environment variable when using --ignore-env
+    #[arg(short = 'k', long = "keep-env-var", action = clap::ArgAction::Append)]
+    pub keep_env_var: Vec<String>,
 
-    /// Arguments to pass to the script (used in shebang mode)
-    #[arg(long = "script-args", hide = true, num_args = 0..)]
-    pub script_args: Vec<String>,
-}
+    /// Set an environment variable
+    #[arg(short = 's', long = "set-env-var", num_args = 2, value_names = ["NAME", "VALUE"], action = clap::ArgAction::Append)]
+    pub set_env_var: Vec<String>,
 
-/// Build the command string for running an interpreter with a script.
-fn build_interpreter_command(interpreter: &str, script: &str, script_args: &[String]) -> String {
-    let mut parts = vec![interpreter.to_string(), script.to_string()];
-    parts.extend(script_args.iter().cloned());
-    // Quote arguments that contain spaces or special characters
-    parts
-        .iter()
-        .map(|arg| {
-            if arg.contains(' ') || arg.contains('\'') || arg.contains('"') {
-                format!("'{}'", arg.replace('\'', "'\\''"))
-            } else {
-                arg.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    /// Unset an environment variable
+    #[arg(short = 'u', long = "unset-env-var", action = clap::ArgAction::Append)]
+    pub unset_env_var: Vec<String>,
 }
 
 pub fn run(args: DevelopArgs) -> Result<()> {
@@ -137,6 +127,9 @@ fn run_file_mode(args: &DevelopArgs, file_path: &PathBuf) -> Result<()> {
         cmd.env("NIX_BUILD_SHELL", "bash");
     }
 
+    // Add environment flags
+    add_env_flags(&mut cmd, args);
+
     if let Some(ref command) = effective_command {
         cmd.args(["--command", command]);
     }
@@ -148,16 +141,43 @@ fn run_file_mode(args: &DevelopArgs, file_path: &PathBuf) -> Result<()> {
     Err(anyhow!("failed to exec nix-shell: {}", err))
 }
 
-/// Determine the effective command to run based on interpreter/script/command args
+/// Determine the effective command to run based on --command args
 fn get_effective_command(args: &DevelopArgs) -> Option<String> {
-    if let Some(ref interpreter) = args.interpreter {
-        if let Some(ref script) = args.script {
-            Some(build_interpreter_command(interpreter, script, &args.script_args))
-        } else {
-            Some(interpreter.clone())
-        }
+    if !args.command.is_empty() {
+        // Join command and args into a single string for nix-shell --command
+        // nix-shell --command expects a shell command string that will be executed via bash -c
+        // So we just join all arguments with spaces - this matches nix develop -c behavior
+        Some(args.command.join(" "))
     } else {
-        args.command.clone()
+        None
+    }
+}
+
+/// Add environment-related flags to nix-shell command.
+/// nix-shell uses --pure for --ignore-env, --keep for --keep-env-var.
+/// For --set-env-var and --unset-env-var, we apply them via Command::env/env_remove
+/// since nix-shell doesn't have direct equivalents.
+fn add_env_flags(cmd: &mut Command, args: &DevelopArgs) {
+    // --ignore-env maps to nix-shell --pure
+    if args.ignore_env {
+        cmd.arg("--pure");
+    }
+
+    // --keep-env-var maps to nix-shell --keep
+    for var in &args.keep_env_var {
+        cmd.args(["--keep", var]);
+    }
+
+    // --set-env-var: nix-shell doesn't have this, so we set via Command::env
+    for chunk in args.set_env_var.chunks(2) {
+        if chunk.len() == 2 {
+            cmd.env(&chunk[0], &chunk[1]);
+        }
+    }
+
+    // --unset-env-var: nix-shell doesn't have this, so we unset via Command::env_remove
+    for var in &args.unset_env_var {
+        cmd.env_remove(var);
     }
 }
 
@@ -248,6 +268,9 @@ fn run_flake_mode(args: &DevelopArgs) -> Result<()> {
         cmd.env("NIX_BUILD_SHELL", "bash");
     }
 
+    // Add environment flags
+    add_env_flags(&mut cmd, args);
+
     if let Some(ref command) = effective_command {
         cmd.args(["--command", command]);
     }
@@ -268,6 +291,25 @@ fn run_remote(args: &DevelopArgs, effective_command: &Option<String>) -> Result<
 
     let mut cmd = Command::new("nix");
     cmd.arg("develop").arg(&args.installable);
+
+    // Add environment flags (nix develop uses same flag names)
+    if args.ignore_env {
+        cmd.arg("--ignore-env");
+    }
+
+    for var in &args.keep_env_var {
+        cmd.args(["--keep-env-var", var]);
+    }
+
+    for chunk in args.set_env_var.chunks(2) {
+        if chunk.len() == 2 {
+            cmd.args(["--set-env-var", &chunk[0], &chunk[1]]);
+        }
+    }
+
+    for var in &args.unset_env_var {
+        cmd.args(["--unset-env-var", var]);
+    }
 
     if let Some(ref command) = effective_command {
         cmd.args(["--command", "sh", "-c", command]);

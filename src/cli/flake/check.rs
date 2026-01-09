@@ -59,6 +59,10 @@ pub struct CheckArgs {
     /// Do not build checks
     #[arg(long)]
     pub no_build: bool,
+
+    /// Accepted for nix CLI compatibility (trix is always impure)
+    #[arg(long, hide = true)]
+    pub impure: bool,
 }
 
 #[instrument(level = "debug", skip_all, fields(flake_ref = %args.flake_ref))]

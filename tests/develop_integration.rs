@@ -149,10 +149,9 @@ fn local_develop_evaluates() {
 
 #[test]
 fn local_develop_runs_command() {
-    // Use shell -c to pass the full command as a single string
-    // (trix's -c takes a single command argument, not trailing args like nix)
+    // trix's -c now takes trailing args like nix develop
     let output = Command::new(trix_bin())
-        .args(["develop", ".", "-c", "echo hello"])
+        .args(["develop", ".", "-c", "echo", "hello"])
         .output()
         .expect("failed to run trix");
 

@@ -21,6 +21,10 @@ pub struct ShellArgs {
     /// Command to run in the shell
     #[arg(short = 'c', long)]
     pub command: Option<String>,
+
+    /// Accepted for nix CLI compatibility (trix is always impure)
+    #[arg(long, hide = true)]
+    pub impure: bool,
 }
 
 #[instrument(level = "debug", skip_all)]
