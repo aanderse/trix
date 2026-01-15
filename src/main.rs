@@ -55,6 +55,8 @@ enum Commands {
     Hash(cli::hash::HashArgs),
     /// Show build logs for a package
     Log(cli::log::LogArgs),
+    /// Manage NixOS system configurations
+    Os(cli::os::OsArgs),
     /// Manage Nix profiles
     Profile(cli::profile::ProfileArgs),
     /// Manage flake registries
@@ -149,6 +151,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Fmt(args) => cli::fmt::run(args),
         Commands::Hash(args) => cli::hash::run(args),
         Commands::Log(args) => cli::log::run(args),
+        Commands::Os(args) => cli::os::run(args),
         Commands::Profile(args) => cli::profile::run(args),
         Commands::Registry(args) => cli::registry::run(args),
         Commands::Search(args) => cli::search::run(args),

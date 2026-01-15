@@ -41,6 +41,9 @@ reqwest = { version = "0.11", features = ["blocking", "json"] }
 # Home directory detection
 dirs = "5"
 
+# System hostname
+hostname = "0.4"
+
 # Shell expansion (~)
 shellexpand = "3"
 

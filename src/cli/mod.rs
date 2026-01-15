@@ -7,6 +7,7 @@ pub mod flake;
 pub mod fmt;
 pub mod hash;
 pub mod log;
+pub mod os;
 pub mod profile;
 pub mod registry;
 pub mod repl;
