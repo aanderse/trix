@@ -14,13 +14,13 @@ use crate::flake::resolve_installable;
 
 #[derive(Args)]
 pub struct UpdateArgs {
-    /// Flake reference (default: .)
-    #[arg(default_value = ".")]
-    pub flake_ref: String,
-
     /// Input(s) to update (updates all if not specified)
     #[arg()]
     pub inputs: Vec<String>,
+
+    /// Flake reference (default: current directory)
+    #[arg(long = "flake", default_value = ".")]
+    pub flake_ref: String,
 
     /// Override an input with a different flake reference
     /// Usage: --override-input INPUT FLAKE_REF
