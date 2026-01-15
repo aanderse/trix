@@ -70,7 +70,7 @@ pub fn run(args: ReplArgs) -> Result<()> {
 
             // Generate the evaluation expression for the whole flake outputs
             // We pass an empty attr_path to get the full outputs attrset
-            let expr = generate_flake_eval_expr(path_str, &lock, &[])?;
+            let expr = generate_flake_eval_expr(path_str, &lock, &[], &HashMap::new())?;
 
             info!("starting repl for {}", flake_path.display());
             debug!("using --expr to evaluate flake in-place (no store copy)");

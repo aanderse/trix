@@ -391,16 +391,23 @@ pub fn parse_installable_for_profile(installable: &str) -> (String, String, Stri
 
 /// Build a package and return its store path.
 /// Uses native evaluation.
-fn build_package(flake_dir: &Path, attr_path: &[String]) -> Result<String> {
+fn build_package(
+    flake_dir: &Path,
+    attr_path: &[String],
+    input_overrides: &HashMap<String, String>,
+) -> Result<String> {
     let eval_target = format!("{}#{}", flake_dir.display(), attr_path.join("."));
     info!("evaluating {}", eval_target);
 
     let status = progress::evaluating(&eval_target);
 
     let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-    let value = eval
-        .eval_flake_attr(flake_dir, attr_path)
-        .context("failed to evaluate derivation")?;
+    let value = if input_overrides.is_empty() {
+        eval.eval_flake_attr(flake_dir, attr_path)
+    } else {
+        eval.eval_flake_attr_with_overrides(flake_dir, attr_path, input_overrides)
+    }
+    .context("failed to evaluate derivation")?;
 
     status.finish_and_clear();
 
@@ -419,7 +426,12 @@ fn build_package(flake_dir: &Path, attr_path: &[String]) -> Result<String> {
 }
 
 /// Install a package to the profile.
-pub fn install(installable: &str, priority: i32, refresh: bool) -> Result<String> {
+pub fn install(
+    installable: &str,
+    priority: i32,
+    refresh: bool,
+    input_overrides: &HashMap<String, String>,
+) -> Result<String> {
     let system = current_system()?;
     let cwd = std::env::current_dir().context("failed to get current directory")?;
 
@@ -449,7 +461,7 @@ pub fn install(installable: &str, priority: i32, refresh: bool) -> Result<String
             let mut found = None;
 
             for candidate in &candidates {
-                match build_package(flake_path, candidate) {
+                match build_package(flake_path, candidate, input_overrides) {
                     Ok(path) => {
                         found = Some((candidate.clone(), path));
                         break;
@@ -635,7 +647,11 @@ pub fn remove(name: &str) -> Result<bool> {
 }
 
 /// Upgrade packages in profile (both local and remote).
-pub fn upgrade(name: Option<&str>, refresh: bool) -> Result<(u32, u32)> {
+pub fn upgrade(
+    name: Option<&str>,
+    refresh: bool,
+    input_overrides: &HashMap<String, String>,
+) -> Result<(u32, u32)> {
     let manifest = get_current_manifest()?;
     let system = current_system()?;
 
@@ -688,14 +704,14 @@ pub fn upgrade(name: Option<&str>, refresh: bool) -> Result<(u32, u32)> {
                 );
                 let attr_path = &candidates[0];
 
-                match build_package(&flake_dir, attr_path) {
+                match build_package(&flake_dir, attr_path, input_overrides) {
                     Ok(new_path) => {
                         if new_path != old_path {
                             debug!("upgrading {}: {} -> {}", pkg_name, old_path, new_path);
 
                             // Re-install with new store path (refresh doesn't matter for local)
                             let installable = format!("{}#{}", path, attr);
-                            install(&installable, element.priority, false)?;
+                            install(&installable, element.priority, false, input_overrides)?;
 
                             upgraded += 1;
                         } else {
@@ -749,7 +765,7 @@ pub fn upgrade(name: Option<&str>, refresh: bool) -> Result<(u32, u32)> {
                     debug!("upgrading {}: {} -> {}", pkg_name, old_path, new_path);
 
                     // Re-install with new store path
-                    install(&flake_ref, element.priority, refresh)?;
+                    install(&flake_ref, element.priority, refresh, input_overrides)?;
                     upgraded += 1;
                 } else {
                     skipped += 1;

@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument};
 
+use crate::cli::build::parse_override_inputs;
 use crate::eval::Evaluator;
 use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
 use crate::progress;
@@ -21,6 +22,11 @@ pub struct ShellArgs {
     /// Command to run in the shell
     #[arg(short = 'c', long)]
     pub command: Option<String>,
+
+    /// Override a flake input with a local path (avoids store copy for the override)
+    /// Usage: --override-input nixpkgs ~/nixpkgs
+    #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+    pub override_input: Vec<String>,
 
     /// Accepted for nix CLI compatibility (trix is always impure)
     #[arg(long, hide = true)]
@@ -51,6 +57,12 @@ pub fn run(args: ShellArgs) -> Result<()> {
     let mut store_paths = Vec::new();
     let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
 
+    // Parse override inputs
+    let input_overrides = parse_override_inputs(&args.override_input);
+    if !input_overrides.is_empty() {
+        debug!(?input_overrides, "using input overrides");
+    }
+
     // Build each installable
     for installable in &args.installables {
         debug!("processing installable: {}", installable);
@@ -66,9 +78,11 @@ pub fn run(args: ShellArgs) -> Result<()> {
         let status = progress::evaluating(&eval_target);
 
         // Evaluate using native evaluator
-        let value = eval
-            .eval_flake_attr(&flake_path, attr_path)
-            .context(format!("failed to evaluate {}", installable))?;
+        let value = if input_overrides.is_empty() {
+            eval.eval_flake_attr(&flake_path, attr_path)
+        } else {
+            eval.eval_flake_attr_with_overrides(&flake_path, attr_path, &input_overrides)
+        }.context(format!("failed to evaluate {}", installable))?;
 
         status.finish_and_clear();
 

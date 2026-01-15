@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
@@ -10,6 +11,17 @@ use tracing::{debug, info, instrument, trace};
 use crate::eval::Evaluator;
 use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
 use crate::progress;
+
+/// Parse --override-input pairs into a HashMap.
+pub fn parse_override_inputs(override_input: &[String]) -> HashMap<String, String> {
+    let mut overrides = HashMap::new();
+    for chunk in override_input.chunks(2) {
+        if chunk.len() == 2 {
+            overrides.insert(chunk[0].clone(), chunk[1].clone());
+        }
+    }
+    overrides
+}
 
 #[derive(Args)]
 pub struct BuildArgs {
@@ -38,6 +50,11 @@ pub struct BuildArgs {
     /// Usage: --argstr name 'value'
     #[arg(long = "argstr", num_args = 2, value_names = ["NAME", "VALUE"], action = clap::ArgAction::Append, requires = "file")]
     pub argstr: Vec<String>,
+
+    /// Override a flake input with a local path (avoids store copy for the override)
+    /// Usage: --override-input nixpkgs ~/nixpkgs
+    #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+    pub override_input: Vec<String>,
 
     /// Symlink name for build output
     #[arg(short = 'o', long, default_value = "result")]
@@ -244,6 +261,12 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
         format!("path:{}", canonical.display())
     };
 
+    // Parse override inputs
+    let input_overrides = parse_override_inputs(&args.override_input);
+    if !input_overrides.is_empty() {
+        debug!(?input_overrides, "using input overrides");
+    }
+
     let (attr_path, value) = {
         let mut found = None;
 
@@ -251,7 +274,13 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
             let eval_target = format!("{}#{}", flake_path.display(), candidate.join("."));
             trace!("trying {}", eval_target);
 
-            match eval.eval_flake_attr(flake_path, candidate) {
+            let result = if input_overrides.is_empty() {
+                eval.eval_flake_attr(flake_path, candidate)
+            } else {
+                eval.eval_flake_attr_with_overrides(flake_path, candidate, &input_overrides)
+            };
+
+            match result {
                 Ok(value) => {
                     info!("evaluating {}", eval_target);
                     found = Some((candidate.clone(), value));

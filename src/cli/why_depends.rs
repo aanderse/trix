@@ -1,5 +1,6 @@
 //! Why-depends command - show why a package depends on another.
 
+use std::collections::HashMap;
 use std::env;
 use std::process::Command;
 
@@ -80,7 +81,7 @@ fn resolve_to_store_path(ref_str: &str, cwd: &std::path::Path) -> Result<String>
     let flake_dir = flake_path
         .to_str()
         .ok_or_else(|| anyhow!("invalid flake path"))?;
-    let expr = generate_flake_eval_expr(flake_dir, lock, attr_path)?;
+    let expr = generate_flake_eval_expr(flake_dir, lock, attr_path, &HashMap::new())?;
 
     debug!(attr = %attr_path.join("."), "building to get store path");
 

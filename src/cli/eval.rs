@@ -1,5 +1,6 @@
 //! Eval command - evaluate Nix expressions.
 
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
@@ -7,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use nix_bindings_expr::value::ValueType;
 
+use crate::cli::build::parse_override_inputs;
 use crate::eval::Evaluator;
 use crate::flake::{current_system, resolve_installable_any};
 use crate::progress;
@@ -39,6 +41,11 @@ pub struct EvalArgs {
     #[arg(long = "argstr", num_args = 2, value_names = ["NAME", "VALUE"], action = clap::ArgAction::Append)]
     pub argstr: Vec<String>,
 
+    /// Override a flake input with a local path (avoids store copy for the override)
+    /// Usage: --override-input nixpkgs ~/nixpkgs
+    #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+    pub override_input: Vec<String>,
+
     /// Produce output in JSON format
     #[arg(long)]
     pub json: bool,
@@ -63,6 +70,13 @@ pub fn run(args: EvalArgs) -> Result<()> {
 
     let status = progress::evaluating(&args.installable);
     let mut evaluator = Evaluator::new().context("failed to initialize Nix evaluator")?;
+
+    // Parse override inputs
+    let input_overrides = parse_override_inputs(&args.override_input);
+    if !input_overrides.is_empty() {
+        use tracing::debug;
+        debug!(?input_overrides, "using input overrides");
+    }
 
     // Build args expression if needed
     let args_expr = build_args_expr(&args.arg, &args.argstr)?;
@@ -125,7 +139,7 @@ pub fn run(args: EvalArgs) -> Result<()> {
         }
     } else {
         // Default: evaluate as installable (flake reference)
-        eval_installable(&mut evaluator, &args.installable)?
+        eval_installable(&mut evaluator, &args.installable, &input_overrides)?
     };
 
     // Apply function if --apply is specified
@@ -217,7 +231,11 @@ fn is_valid_nix_identifier(s: &str) -> bool {
 }
 
 /// Evaluate an installable (flake reference with optional attribute path).
-fn eval_installable(evaluator: &mut Evaluator, installable: &str) -> Result<crate::eval::NixValue> {
+fn eval_installable(
+    evaluator: &mut Evaluator,
+    installable: &str,
+    input_overrides: &HashMap<String, String>,
+) -> Result<crate::eval::NixValue> {
     use tracing::debug;
 
     let cwd = env::current_dir().context("failed to get current directory")?;
@@ -238,7 +256,12 @@ fn eval_installable(evaluator: &mut Evaluator, installable: &str) -> Result<crat
         // Try each candidate until one works
         let mut last_err = None;
         for candidate in &candidates {
-            match evaluator.eval_flake_attr(flake_path, candidate) {
+            let result = if input_overrides.is_empty() {
+                evaluator.eval_flake_attr(flake_path, candidate)
+            } else {
+                evaluator.eval_flake_attr_with_overrides(flake_path, candidate, input_overrides)
+            };
+            match result {
                 Ok(value) => return Ok(value),
                 Err(e) => {
                     debug!("candidate {} failed: {}", candidate.join("."), e);

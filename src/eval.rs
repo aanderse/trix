@@ -136,6 +136,20 @@ impl Evaluator {
     /// is NEVER copied to the store.
     #[instrument(level = "debug", skip(self), fields(flake = %flake_path.display(), attr = ?attr_path))]
     pub fn eval_flake_attr(&mut self, flake_path: &Path, attr_path: &[String]) -> Result<NixValue> {
+        self.eval_flake_attr_with_overrides(flake_path, attr_path, &HashMap::new())
+    }
+
+    /// Evaluate a flake's outputs with input overrides.
+    ///
+    /// Like `eval_flake_attr`, but allows overriding specific inputs with local paths.
+    /// The overridden inputs are imported directly without copying to the store.
+    #[instrument(level = "debug", skip(self, input_overrides), fields(flake = %flake_path.display(), attr = ?attr_path))]
+    pub fn eval_flake_attr_with_overrides(
+        &mut self,
+        flake_path: &Path,
+        attr_path: &[String],
+        input_overrides: &HashMap<String, String>,
+    ) -> Result<NixValue> {
         let path_str = flake_path
             .to_str()
             .ok_or_else(|| anyhow!("invalid flake path"))?;
@@ -160,9 +174,13 @@ impl Evaluator {
             }
         };
 
+        if !input_overrides.is_empty() {
+            debug!(?input_overrides, "applying input overrides");
+        }
+
         // Generate the evaluation expression
         debug!("generating eval expression");
-        let expr = generate_flake_eval_expr(path_str, &lock, attr_path)?;
+        let expr = generate_flake_eval_expr(path_str, &lock, attr_path, input_overrides)?;
         trace!("generated expression:\n{}", expr);
 
         debug!("evaluating flake");
@@ -755,12 +773,16 @@ impl Evaluator {
 /// 3. Constructs the inputs attrset from flake.lock data
 /// 4. Calls flake.outputs with the constructed inputs
 ///
+/// The `input_overrides` parameter allows overriding specific inputs with local paths,
+/// which are imported directly without copying to the store (just like the main flake).
+///
 /// This function is public because it's also used by Evaluator::eval_flake_attr
 /// to generate expressions for internal evaluation.
 pub fn generate_flake_eval_expr(
     flake_dir: &str,
     lock: &FlakeLock,
     attr_path: &[String],
+    input_overrides: &HashMap<String, String>,
 ) -> Result<String> {
     // Get root node's inputs
     let root_node = lock.nodes.get(&lock.root);
@@ -782,7 +804,22 @@ pub fn generate_flake_eval_expr(
         let node = lock.nodes.get(node_name)
             .ok_or_else(|| anyhow!("node '{}' not found in lock", node_name))?;
 
-        // Generate the source fetch expression
+        // Check if this input is overridden with a local path
+        if let Some(override_path) = input_overrides.get(node_name) {
+            // Resolve the override path (handle ~ and relative paths)
+            let resolved_path = resolve_override_path(override_path)?;
+
+            // Generate expression for overridden input (local path, no store copy)
+            let override_expr = generate_override_input_expr(
+                node_name,
+                &resolved_path,
+                node.flake,
+            )?;
+            let_bindings.push(override_expr);
+            continue;
+        }
+
+        // Generate the source fetch expression (normal path)
         let src_binding = if let Some(ref locked) = node.locked {
             let fetch_expr = generate_fetch_expr(locked, flake_dir);
             format!("_src_{} = {};", sanitize_name(node_name), fetch_expr)
@@ -1123,6 +1160,222 @@ fn get_git_metadata(flake_dir: &str) -> String {
         r#"rev = "{}"; shortRev = "{}"; lastModified = {}; lastModifiedDate = "{}";"#,
         rev, short_rev, timestamp, date_str
     )
+}
+
+/// Resolve an override path, handling ~ expansion and converting to absolute path.
+fn resolve_override_path(path: &str) -> Result<String> {
+    let expanded = if path.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .context("HOME environment variable not set")?;
+        format!("{}{}", home, &path[1..])
+    } else if path.starts_with('~') {
+        // ~user/path - not supported for simplicity
+        return Err(anyhow!("~user paths are not supported, use absolute path or ~/"));
+    } else {
+        path.to_string()
+    };
+
+    // Convert to absolute path if relative
+    let abs_path = if expanded.starts_with('/') {
+        expanded
+    } else {
+        let cwd = std::env::current_dir()
+            .context("failed to get current directory")?;
+        cwd.join(&expanded)
+            .canonicalize()
+            .with_context(|| format!("override path does not exist: {}", expanded))?
+            .to_string_lossy()
+            .to_string()
+    };
+
+    // Verify the path exists and has a flake.nix
+    let flake_nix = Path::new(&abs_path).join("flake.nix");
+    if !flake_nix.exists() {
+        return Err(anyhow!(
+            "override path '{}' does not contain a flake.nix",
+            abs_path
+        ));
+    }
+
+    Ok(abs_path)
+}
+
+/// Generate a Nix expression for an overridden input (local path, no store copy).
+///
+/// This handles the case where --override-input specifies a local path.
+/// We import the flake.nix directly and read its flake.lock to construct inputs.
+fn generate_override_input_expr(
+    node_name: &str,
+    override_path: &str,
+    _is_flake_hint: bool,
+) -> Result<String> {
+    let sanitized = sanitize_name(node_name);
+
+    // Determine if the override path is a flake by checking for flake.nix
+    // This is more reliable than using the original lock's flake flag
+    let flake_nix_path = Path::new(override_path).join("flake.nix");
+    let is_flake = flake_nix_path.exists();
+
+    if !is_flake {
+        // Non-flake override - just use direct path
+        return Ok(format!(
+            "{name} = {{ outPath = {path}; }};",
+            name = sanitized,
+            path = override_path
+        ));
+    }
+
+    // For flake overrides, we need to construct the full input
+    // Read the override's flake.lock if it exists
+    let lock_path = Path::new(override_path).join("flake.lock");
+
+    let (inputs_expr, nested_bindings) = if lock_path.exists() {
+        // Parse the override's lock file
+        let lock_content = std::fs::read_to_string(&lock_path)
+            .with_context(|| format!("failed to read {}", lock_path.display()))?;
+        let override_lock: FlakeLock = serde_json::from_str(&lock_content)
+            .with_context(|| format!("failed to parse {}", lock_path.display()))?;
+
+        // Generate expressions for the override's inputs
+        generate_override_inputs(&override_lock, override_path)?
+    } else {
+        // No lock file - the override has no inputs
+        ("{ }".to_string(), String::new())
+    };
+
+    // Get git metadata for the override path
+    let git_attrs = get_git_metadata(override_path);
+
+    Ok(format!(
+        r#"# Overridden input: {node_name} -> {override_path}
+  {nested_bindings}{name} = let
+    _override_path = {path};
+    _flake = import (_override_path + "/flake.nix");
+    _inputs = {inputs};
+    _self = {{ outPath = _override_path; inputs = _inputs; _type = "flake"; {git_attrs} }};
+    _outputs = _flake.outputs (_inputs // {{ self = _self // _outputs; }});
+  in _outputs // {{ outPath = _override_path; inputs = _inputs; outputs = _outputs; _type = "flake"; }};"#,
+        node_name = node_name,
+        override_path = override_path,
+        nested_bindings = nested_bindings,
+        name = sanitized,
+        path = override_path,
+        inputs = inputs_expr,
+        git_attrs = git_attrs,
+    ))
+}
+
+/// Generate input expressions for an override's dependencies.
+/// Returns (inputs_attrset_expr, nested_let_bindings).
+fn generate_override_inputs(lock: &FlakeLock, override_path: &str) -> Result<(String, String)> {
+    let root_node = match lock.nodes.get(&lock.root) {
+        Some(node) => node,
+        None => return Ok(("{ }".to_string(), String::new())),
+    };
+
+    if root_node.inputs.is_empty() {
+        return Ok(("{ }".to_string(), String::new()));
+    }
+
+    // Sort nodes topologically
+    let sorted_nodes = topological_sort_nodes(lock)?;
+
+    let mut let_bindings = Vec::new();
+    let mut input_attrs = Vec::new();
+
+    // Generate fetch/build expressions for each input
+    for node_name in &sorted_nodes {
+        if node_name == &lock.root {
+            continue;
+        }
+
+        let node = lock.nodes.get(node_name)
+            .ok_or_else(|| anyhow!("node '{}' not found in override lock", node_name))?;
+
+        // Generate fetch expression
+        if let Some(ref locked) = node.locked {
+            let fetch_expr = generate_fetch_expr(locked, override_path);
+            let_bindings.push(format!(
+                "_override_src_{} = {};",
+                sanitize_name(node_name),
+                fetch_expr
+            ));
+
+            // Build the input
+            if node.flake {
+                let src_name = format!("_override_src_{}", sanitize_name(node_name));
+                let nested_inputs = generate_nested_input_refs(&node.inputs, lock, "_override_")?;
+                let_bindings.push(format!(
+                    r#"_override_{name} = let
+      _flake = import ({src} + "/flake.nix");
+      _inputs = {{ {nested_inputs} }};
+      _self = {{ outPath = {src}; inputs = _inputs; _type = "flake"; }};
+      _outputs = _flake.outputs (_inputs // {{ self = _self // _outputs; }});
+    in _outputs // {{ outPath = {src}; inputs = _inputs; outputs = _outputs; _type = "flake"; }};"#,
+                    name = sanitize_name(node_name),
+                    src = src_name,
+                    nested_inputs = nested_inputs,
+                ));
+            } else {
+                let_bindings.push(format!(
+                    "_override_{name} = {{ outPath = _override_src_{name}; }};",
+                    name = sanitize_name(node_name)
+                ));
+            }
+        }
+    }
+
+    // Build root inputs attrset
+    for (input_name, input_ref) in &root_node.inputs {
+        let resolved = match input_ref {
+            InputRef::Direct(name) => format!("_override_{}", sanitize_name(name)),
+            InputRef::Follows(path) => {
+                if path.is_empty() {
+                    "_self".to_string() // Points to the override's self
+                } else {
+                    match resolve_follows_to_name(path, lock)? {
+                        FollowsResolution::Node(name) => format!("_override_{}", name),
+                        FollowsResolution::Self_ => "_self".to_string(),
+                    }
+                }
+            }
+        };
+        input_attrs.push(format!("\"{}\" = {};", input_name, resolved));
+    }
+
+    let bindings_str = if let_bindings.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n  ", let_bindings.join("\n  "))
+    };
+
+    Ok((format!("{{ {} }}", input_attrs.join(" ")), bindings_str))
+}
+
+/// Generate input references for nested inputs (within an override's input).
+fn generate_nested_input_refs(
+    inputs: &HashMap<String, InputRef>,
+    lock: &FlakeLock,
+    prefix: &str,
+) -> Result<String> {
+    let mut refs = Vec::new();
+    for (input_name, input_ref) in inputs {
+        let resolved = match input_ref {
+            InputRef::Direct(name) => format!("{}{}", prefix, sanitize_name(name)),
+            InputRef::Follows(path) => {
+                if path.is_empty() {
+                    "_self".to_string()
+                } else {
+                    match resolve_follows_to_name(path, lock)? {
+                        FollowsResolution::Node(name) => format!("{}{}", prefix, name),
+                        FollowsResolution::Self_ => "_self".to_string(),
+                    }
+                }
+            }
+        };
+        refs.push(format!("\"{}\" = {};", input_name, resolved));
+    }
+    Ok(refs.join(" "))
 }
 
 /// A Nix value wrapper.

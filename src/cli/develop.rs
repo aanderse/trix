@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument};
 
+use crate::cli::build::parse_override_inputs;
 use crate::eval::Evaluator;
 use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
 use crate::progress;
@@ -38,6 +39,11 @@ pub struct DevelopArgs {
     /// Usage: --argstr name 'value'
     #[arg(long = "argstr", num_args = 2, value_names = ["NAME", "VALUE"], action = clap::ArgAction::Append, requires = "file")]
     pub argstr: Vec<String>,
+
+    /// Override a flake input with a local path (avoids store copy for the override)
+    /// Usage: --override-input nixpkgs ~/nixpkgs
+    #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+    pub override_input: Vec<String>,
 
     /// Command and arguments to run instead of interactive shell
     #[arg(short = 'c', long = "command", num_args = 1.., allow_hyphen_values = true)]
@@ -209,6 +215,12 @@ fn run_flake_mode(args: &DevelopArgs) -> Result<()> {
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Develop, &system);
     debug!(candidates = ?candidates, %system, "expanded attribute candidates");
 
+    // Parse override inputs
+    let input_overrides = parse_override_inputs(&args.override_input);
+    if !input_overrides.is_empty() {
+        debug!(?input_overrides, "using input overrides");
+    }
+
     // Step 3: Evaluate the devShell to get drvPath using native evaluation
     // Try each candidate in order until one succeeds (fallback order: devShells, devShell, packages)
     let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
@@ -221,7 +233,12 @@ fn run_flake_mode(args: &DevelopArgs) -> Result<()> {
         debug!(attr = %attr_path.join("."), "trying candidate");
 
         let status = progress::evaluating(&eval_target);
-        match eval.eval_flake_attr(&flake_path, attr_path) {
+        let result = if input_overrides.is_empty() {
+            eval.eval_flake_attr(&flake_path, attr_path)
+        } else {
+            eval.eval_flake_attr_with_overrides(&flake_path, attr_path, &input_overrides)
+        };
+        match result {
             Ok(value) => {
                 match eval.get_drv_path(&value) {
                     Ok(path) => {

@@ -1,5 +1,6 @@
 //! Log command - show build logs for a package.
 
+use std::collections::HashMap;
 use std::env;
 use std::process::Command;
 
@@ -73,7 +74,7 @@ pub fn run(args: LogArgs) -> Result<()> {
     let flake_dir = flake_path
         .to_str()
         .ok_or_else(|| anyhow!("invalid flake path"))?;
-    let expr = generate_flake_eval_expr(flake_dir, lock, &attr_path)?;
+    let expr = generate_flake_eval_expr(flake_dir, lock, &attr_path, &HashMap::new())?;
 
     let output = Command::new("nix-instantiate")
         .args(["-E", &expr])

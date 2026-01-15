@@ -8,6 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument};
 
+use crate::cli::build::parse_override_inputs;
 use crate::eval::Evaluator;
 use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext, ResolvedInstallable};
 use crate::progress;
@@ -17,6 +18,11 @@ pub struct RunArgs {
     /// Installable reference (e.g., '.#hello', 'nixpkgs#cowsay')
     #[arg(default_value = ".#default")]
     pub installable: String,
+
+    /// Override a flake input with a local path (avoids store copy for the override)
+    /// Usage: --override-input nixpkgs ~/nixpkgs
+    #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+    pub override_input: Vec<String>,
 
     /// Accepted for nix CLI compatibility (trix is always impure)
     #[arg(long, hide = true)]
@@ -55,13 +61,24 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     let mut evaluator = Evaluator::new().context("failed to initialize Nix evaluator")?;
 
+    // Parse override inputs
+    let input_overrides = parse_override_inputs(&args.override_input);
+    if !input_overrides.is_empty() {
+        debug!(?input_overrides, "using input overrides");
+    }
+
     // Try each candidate until one succeeds
     let (attr_path, value) = {
         let mut last_err = None;
         let mut found = None;
 
         for candidate in &candidates {
-            match evaluator.eval_flake_attr(flake_path, candidate) {
+            let result = if input_overrides.is_empty() {
+                evaluator.eval_flake_attr(flake_path, candidate)
+            } else {
+                evaluator.eval_flake_attr_with_overrides(flake_path, candidate, &input_overrides)
+            };
+            match result {
                 Ok(value) => {
                     debug!(attr = %candidate.join("."), "found attribute");
                     found = Some((candidate.clone(), value));

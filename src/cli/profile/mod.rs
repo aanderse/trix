@@ -14,6 +14,7 @@ use chrono::{DateTime, Local};
 use clap::{Args, Subcommand};
 use tracing::debug;
 
+use crate::cli::build::parse_override_inputs;
 use crate::profile::{
     self, extract_version, format_size, format_size_diff, get_closure,
     get_current_profile_path_for, get_profile_dir_for, get_store_path_size, group_by_package,
@@ -51,6 +52,11 @@ enum ProfileCommand {
         /// Consider all previously downloaded files out-of-date
         #[arg(long)]
         refresh: bool,
+
+        /// Override a flake input with a local path (avoids store copy for the override)
+        /// Usage: --override-input nixpkgs ~/nixpkgs
+        #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+        override_input: Vec<String>,
     },
     /// Alias for 'add'
     Install {
@@ -65,6 +71,11 @@ enum ProfileCommand {
         /// Consider all previously downloaded files out-of-date
         #[arg(long)]
         refresh: bool,
+
+        /// Override a flake input with a local path (avoids store copy for the override)
+        /// Usage: --override-input nixpkgs ~/nixpkgs
+        #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+        override_input: Vec<String>,
     },
     /// Remove packages from a profile
     Remove {
@@ -80,6 +91,11 @@ enum ProfileCommand {
         /// Consider all previously downloaded files out-of-date
         #[arg(long)]
         refresh: bool,
+
+        /// Override a flake input with a local path (avoids store copy for the override)
+        /// Usage: --override-input nixpkgs ~/nixpkgs
+        #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+        override_input: Vec<String>,
     },
     /// Show all versions of a profile
     History,
@@ -111,14 +127,16 @@ pub fn run(args: ProfileArgs) -> Result<()> {
             installables,
             priority,
             refresh,
+            override_input,
         }
         | ProfileCommand::Install {
             installables,
             priority,
             refresh,
-        } => run_add(&installables, priority, refresh, profile),
+            override_input,
+        } => run_add(&installables, priority, refresh, &override_input, profile),
         ProfileCommand::Remove { packages } => run_remove(&packages, profile),
-        ProfileCommand::Upgrade { package, refresh } => run_upgrade(package.as_deref(), refresh, profile),
+        ProfileCommand::Upgrade { package, refresh, override_input } => run_upgrade(package.as_deref(), refresh, &override_input, profile),
         ProfileCommand::History => run_history(profile),
         ProfileCommand::Rollback { to } => run_rollback(to, profile),
         ProfileCommand::WipeHistory {
@@ -178,12 +196,14 @@ fn run_list(output_json: bool, profile: Option<&std::path::Path>) -> Result<()> 
     Ok(())
 }
 
-fn run_add(installables: &[String], priority: i32, refresh: bool, _profile: Option<&std::path::Path>) -> Result<()> {
+fn run_add(installables: &[String], priority: i32, refresh: bool, override_input: &[String], _profile: Option<&std::path::Path>) -> Result<()> {
     // TODO: Pass profile to install function when profile::install_for is implemented
+    let input_overrides = parse_override_inputs(override_input);
+
     for installable in installables {
         debug!("installing {}...", installable);
 
-        let pkg_name = profile::install(installable, priority, refresh)?;
+        let pkg_name = profile::install(installable, priority, refresh, &input_overrides)?;
         println!("Added {}", pkg_name);
     }
 
@@ -203,9 +223,10 @@ fn run_remove(packages: &[String], _profile: Option<&std::path::Path>) -> Result
     Ok(())
 }
 
-fn run_upgrade(name: Option<&str>, refresh: bool, _profile: Option<&std::path::Path>) -> Result<()> {
+fn run_upgrade(name: Option<&str>, refresh: bool, override_input: &[String], _profile: Option<&std::path::Path>) -> Result<()> {
     // TODO: Pass profile to upgrade function when profile::upgrade_for is implemented
-    let (upgraded, skipped) = profile::upgrade(name, refresh)?;
+    let input_overrides = parse_override_inputs(override_input);
+    let (upgraded, skipped) = profile::upgrade(name, refresh, &input_overrides)?;
 
     if upgraded > 0 {
         println!("Upgraded {} package(s)", upgraded);

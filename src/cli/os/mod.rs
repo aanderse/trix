@@ -16,6 +16,7 @@ use clap::{Args, Subcommand};
 use tempfile::TempDir;
 use tracing::{debug, info};
 
+use crate::cli::build::parse_override_inputs;
 use crate::eval::generate_flake_eval_expr;
 use crate::flake::find_flake_root;
 use crate::lock::FlakeLock;
@@ -51,6 +52,11 @@ pub struct RebuildArgs {
     /// Defaults to current directory with system hostname
     #[arg(long = "flake", short = 'f')]
     pub flake_ref: Option<String>,
+
+    /// Override a flake input with a local path (avoids store copy for the override)
+    /// Usage: --override-input nixpkgs ~/nixpkgs
+    #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+    pub override_input: Vec<String>,
 
     /// Prefix activation commands with sudo (for remote deployment as non-root)
     #[arg(long)]
@@ -95,6 +101,11 @@ pub struct ReplArgs {
     /// Defaults to current directory with system hostname
     #[arg(long = "flake", short = 'f', conflicts_with_all = ["file", "attr"])]
     pub flake_ref: Option<String>,
+
+    /// Override a flake input with a local path (avoids store copy for the override)
+    /// Usage: --override-input nixpkgs ~/nixpkgs
+    #[arg(long = "override-input", num_args = 2, value_names = ["INPUT", "PATH"], action = clap::ArgAction::Append)]
+    pub override_input: Vec<String>,
 
     /// Path to a NixOS configuration file (non-flake mode, passes through to nixos-rebuild)
     #[arg(long = "file", short = 'F', requires = "attr")]
@@ -185,6 +196,12 @@ fn run_rebuild(args: RebuildArgs) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("flake path is not valid UTF-8"))?;
 
+    // Parse override inputs
+    let input_overrides = parse_override_inputs(&args.override_input);
+    if !input_overrides.is_empty() {
+        debug!(?input_overrides, "using input overrides");
+    }
+
     // Build attribute path to nixosConfigurations.<hostname>
     // We return the full nixosConfiguration, and nixos-rebuild will access
     // config.system.build.toplevel from it
@@ -193,7 +210,7 @@ fn run_rebuild(args: RebuildArgs) -> Result<()> {
         hostname.clone(),
     ];
 
-    let expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path)?;
+    let expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path, &input_overrides)?;
 
     // Add timestamp header for debugging
     let expr_with_header = format!(
@@ -335,13 +352,19 @@ fn run_repl(args: ReplArgs) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("flake path is not valid UTF-8"))?;
 
+    // Parse override inputs
+    let input_overrides = parse_override_inputs(&args.override_input);
+    if !input_overrides.is_empty() {
+        debug!(?input_overrides, "using input overrides");
+    }
+
     // Build attribute path to nixosConfigurations.<hostname>
     let attr_path = vec![
         "nixosConfigurations".to_string(),
         hostname.clone(),
     ];
 
-    let base_expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path)?;
+    let base_expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path, &input_overrides)?;
 
     // Wrap the expression to expose config, options, pkgs, lib like nixos-rebuild repl does
     let repl_expr = format!(
