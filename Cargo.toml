@@ -62,12 +62,12 @@ tempfile = "3"
 # Directory traversal
 walkdir = "2"
 
-# Nix bindings for native evaluation (using local clone with path coercion fix)
-nix-bindings-util = { path = "../nix-bindings-rust/nix-bindings-util" }
-nix-bindings-store = { path = "../nix-bindings-rust/nix-bindings-store" }
-nix-bindings-expr = { path = "../nix-bindings-rust/nix-bindings-expr" }
-nix-bindings-flake = { path = "../nix-bindings-rust/nix-bindings-flake" }
-nix-bindings-fetchers = { path = "../nix-bindings-rust/nix-bindings-fetchers" }
+# Nix bindings for native evaluation
+nix-bindings-util = "0.2"
+nix-bindings-store = "0.2"
+nix-bindings-expr = "0.2"
+nix-bindings-flake = "0.2"
+nix-bindings-fetchers = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

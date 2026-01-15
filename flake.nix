@@ -3,13 +3,9 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nix-bindings-rust = {
-      url = "github:aanderse/nix-bindings-rust/8f6ec2ec5c3ba8ab33126ec79de7702835592902";
-      flake = false;  # It's not a flake, just source
-    };
   };
 
-  outputs = { self, nixpkgs, nix-bindings-rust }:
+  outputs = { self, nixpkgs }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system);
@@ -55,19 +51,12 @@
       packages = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          # Create combined source tree so ../nix-bindings-rust resolves
-          combinedSrc = pkgs.runCommand "trix-combined-src" {} ''
-            mkdir -p $out/trix $out/nix-bindings-rust
-            cp -r ${./.}/* $out/trix/
-            cp -r ${nix-bindings-rust}/* $out/nix-bindings-rust/
-          '';
         in
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "trix";
             version = "0.1.0";
-            src = combinedSrc;
-            sourceRoot = "trix-combined-src/trix";
+            src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
             };

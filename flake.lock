@@ -1,29 +1,12 @@
 {
   "nodes": {
-    "nix-bindings-rust": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1767664784,
-        "narHash": "sha256-sXQhSXmsZ1cCqmlfahjdbCv/MMeGYb680PELVgkqLIs=",
-        "owner": "aanderse",
-        "repo": "nix-bindings-rust",
-        "rev": "8f6ec2ec5c3ba8ab33126ec79de7702835592902",
-        "type": "github"
-      },
-      "original": {
-        "owner": "aanderse",
-        "repo": "nix-bindings-rust",
-        "rev": "8f6ec2ec5c3ba8ab33126ec79de7702835592902",
-        "type": "github"
-      }
-    },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1767116409,
-        "narHash": "sha256-5vKw92l1GyTnjoLzEagJy5V5mDFck72LiQWZSOnSicw=",
+        "lastModified": 1768305791,
+        "narHash": "sha256-AIdl6WAn9aymeaH/NvBj0H9qM+XuAuYbGMZaP0zcXAQ=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "cad22e7d996aea55ecab064e84834289143e44a0",
+        "rev": "1412caf7bf9e660f2f962917c14b1ea1c3bc695e",
         "type": "github"
       },
       "original": {
@@ -35,7 +18,6 @@
     },
     "root": {
       "inputs": {
-        "nix-bindings-rust": "nix-bindings-rust",
         "nixpkgs": "nixpkgs"
       }
     }

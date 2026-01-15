@@ -1038,8 +1038,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "nix-bindings-bindgen-raw"
-version = "0.1.0"
+name = "nix-bindings-bdwgc-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "915215aae1cf3e7d83621e8634e59a3e12fdaf31406566315cb6b2c3ac87cace"
 dependencies = [
  "bindgen",
  "pkg-config",
@@ -1047,65 +1049,138 @@ dependencies = [
 
 [[package]]
 name = "nix-bindings-expr"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6920535b3dac0ddec8d5ccb13588fd6acf973f5427d43828142aac302e31a9"
 dependencies = [
  "anyhow",
  "cstr",
  "ctor",
  "lazy_static",
- "nix-bindings-bindgen-raw",
+ "nix-bindings-bdwgc-sys",
+ "nix-bindings-expr-sys",
  "nix-bindings-store",
+ "nix-bindings-store-sys",
  "nix-bindings-util",
+ "nix-bindings-util-sys",
+ "pkg-config",
  "tempfile",
+]
+
+[[package]]
+name = "nix-bindings-expr-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a36c0a4822512497f19ed1a0aa516e82e7eb9c056c8b35b9585aa923afd967"
+dependencies = [
+ "bindgen",
+ "nix-bindings-store-sys",
+ "nix-bindings-util-sys",
+ "pkg-config",
 ]
 
 [[package]]
 name = "nix-bindings-fetchers"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf783aeef5615d3ea860cbd038fdac6157124af7a23668f3c36f8d9630a1dcfa"
 dependencies = [
  "anyhow",
  "cstr",
  "ctor",
- "nix-bindings-bindgen-raw",
+ "nix-bindings-fetchers-sys",
  "nix-bindings-store",
  "nix-bindings-util",
  "tempfile",
+]
+
+[[package]]
+name = "nix-bindings-fetchers-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b503d845bc9673959239dd73a3d0408a2703622ca50189a4d9ed7bb4cc68883"
+dependencies = [
+ "bindgen",
+ "nix-bindings-util-sys",
+ "pkg-config",
 ]
 
 [[package]]
 name = "nix-bindings-flake"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b773984590aad9cb12d70c502d62b78fb02432c2861807b265f14ebac4313d20"
 dependencies = [
  "anyhow",
  "cstr",
  "ctor",
  "lazy_static",
- "nix-bindings-bindgen-raw",
  "nix-bindings-expr",
  "nix-bindings-fetchers",
+ "nix-bindings-flake-sys",
  "nix-bindings-store",
  "nix-bindings-util",
  "tempfile",
 ]
 
 [[package]]
+name = "nix-bindings-flake-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c16f47bf98bf83934b1e748fc80bace430d20662285d95998fcd53efd626df3d"
+dependencies = [
+ "bindgen",
+ "nix-bindings-bdwgc-sys",
+ "nix-bindings-expr-sys",
+ "nix-bindings-fetchers-sys",
+ "nix-bindings-store-sys",
+ "nix-bindings-util-sys",
+ "pkg-config",
+]
+
+[[package]]
 name = "nix-bindings-store"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cf7d9d79ac686db0d555440511627d549ec82d684cef987b728ab01fd656a73"
 dependencies = [
  "anyhow",
  "lazy_static",
- "nix-bindings-bindgen-raw",
+ "nix-bindings-store-sys",
  "nix-bindings-util",
+ "nix-bindings-util-sys",
+ "pkg-config",
+]
+
+[[package]]
+name = "nix-bindings-store-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7875215b42bdbf44bb1a5e9aafca5298f9f07217018eb8f1e5aff9009a7b34f"
+dependencies = [
+ "bindgen",
+ "nix-bindings-util-sys",
  "pkg-config",
 ]
 
 [[package]]
 name = "nix-bindings-util"
-version = "0.1.0"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b5e5642310879899e78fc764325c4349ecf55b4dc50763239e4dceb750e07daf"
 dependencies = [
  "anyhow",
- "ctor",
- "nix-bindings-bindgen-raw",
+ "nix-bindings-util-sys",
+]
+
+[[package]]
+name = "nix-bindings-util-sys"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "969f65460b5c4f8ad7a5f4466c77acb609693a3e83d1d5ba21e021954cfdd181"
+dependencies = [
+ "bindgen",
+ "pkg-config",
 ]
 
 [[package]]
