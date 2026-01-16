@@ -264,6 +264,8 @@ fn print_input_node(
                     .as_ref()
                     .and_then(|l| match l {
                         LockedRef::GitHub { last_modified, .. } => *last_modified,
+                        LockedRef::Git { last_modified, .. } => *last_modified,
+                        LockedRef::Path { last_modified, .. } => *last_modified,
                         _ => None,
                     })
                     .map(|lm| format!(" ({})", format_timestamp(lm)))
@@ -315,8 +317,12 @@ fn format_locked_ref(locked: &LockedRef) -> String {
         LockedRef::Sourcehut { owner, repo, rev, .. } => {
             format!("sourcehut:{}/{}/{}", owner, repo, rev)
         }
-        LockedRef::Git { url, rev, .. } => {
-            format!("git+{}?rev={}", url, rev)
+        LockedRef::Git { url, rev, dirty_rev, .. } => {
+            let effective_rev = rev.as_ref().or(dirty_rev.as_ref());
+            match effective_rev {
+                Some(r) => format!("git+{}?rev={}", url, r),
+                None => format!("git+{}", url),
+            }
         }
         LockedRef::Path { path, .. } => {
             format!("path:{}", path)

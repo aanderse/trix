@@ -948,16 +948,21 @@ fn generate_fetch_expr(locked: &LockedRef, flake_dir: &str) -> String {
                 owner, repo, rev, hash_arg
             )
         }
-        LockedRef::Git { url, rev, nar_hash, git_ref } => {
+        LockedRef::Git { url, rev, nar_hash, git_ref, dirty_rev, .. } => {
+            // Use rev if available, otherwise fall back to dirty_rev
+            let effective_rev = rev.as_ref().or(dirty_rev.as_ref());
             let ref_arg = git_ref.as_ref()
                 .map(|r| format!(" ref = \"{}\";", r))
                 .unwrap_or_default();
             let hash_arg = nar_hash.as_ref()
                 .map(|h| format!(" narHash = \"{}\";", h))
                 .unwrap_or_default();
+            let rev_arg = effective_rev
+                .map(|r| format!(" rev = \"{}\";", r))
+                .unwrap_or_default();
             format!(
-                r#"builtins.fetchGit {{ url = "{}"; rev = "{}";{}{} }}"#,
-                url, rev, ref_arg, hash_arg
+                r#"builtins.fetchGit {{ url = "{}";{}{}{} }}"#,
+                url, rev_arg, ref_arg, hash_arg
             )
         }
         LockedRef::Path { path, .. } => {

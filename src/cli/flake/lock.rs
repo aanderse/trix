@@ -538,6 +538,11 @@ fn find_unique_node_name(lock_data: &serde_json::Value, base_name: &str) -> Stri
     }
 }
 
+/// Check if a URL is a bare filesystem path (not a flake URL scheme)
+fn is_bare_path(url: &str) -> bool {
+    url.starts_with('/') || url.starts_with("./") || url.starts_with("../")
+}
+
 fn parse_url_for_lock(
     url: &str,
     prefetch_result: &serde_json::Value,
@@ -547,6 +552,36 @@ fn parse_url_for_lock(
     // - "locked": object with type-specific locked info
     // - "original": object with original reference info
 
+    // Get the hash from prefetch result
+    let hash = prefetch_result
+        .get("hash")
+        .and_then(|h| h.as_str())
+        .or_else(|| prefetch_result.get("narHash").and_then(|h| h.as_str()));
+
+    // If the original URL is a bare path, preserve it as type "path"
+    // even if Nix converts it to git (which would cause store copies)
+    if is_bare_path(url) {
+        let original = serde_json::json!({
+            "type": "path",
+            "path": url,
+        });
+        let mut locked = serde_json::json!({
+            "type": "path",
+            "path": url,
+        });
+        if let Some(h) = hash {
+            locked["narHash"] = serde_json::json!(h);
+        }
+        // Preserve lastModified from the prefetch result for Nix CLI compatibility
+        if let Some(last_modified) = prefetch_result
+            .get("locked")
+            .and_then(|l| l.get("lastModified"))
+        {
+            locked["lastModified"] = last_modified.clone();
+        }
+        return Ok(("path".to_string(), original, locked));
+    }
+
     // If prefetch already gives us locked/original, use them directly
     if prefetch_result.get("locked").is_some() && prefetch_result.get("original").is_some() {
         let mut locked = prefetch_result["locked"].clone();
@@ -555,9 +590,9 @@ fn parse_url_for_lock(
 
         // The hash is at the top level of prefetch output, not inside locked
         // We need to copy it into the locked object as narHash
-        if let Some(hash) = prefetch_result.get("hash").and_then(|h| h.as_str()) {
+        if let Some(h) = hash {
             if locked.get("narHash").is_none() {
-                locked["narHash"] = serde_json::json!(hash);
+                locked["narHash"] = serde_json::json!(h);
             }
         }
 

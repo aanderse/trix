@@ -78,16 +78,26 @@ pub enum LockedRef {
     },
     Git {
         url: String,
-        rev: String,
+        /// The git revision (may be None for dirty repos)
+        rev: Option<String>,
         #[serde(rename = "narHash")]
         nar_hash: Option<String>,
         #[serde(rename = "ref")]
         git_ref: Option<String>,
+        /// Dirty revision (for repos with uncommitted changes)
+        #[serde(rename = "dirtyRev")]
+        dirty_rev: Option<String>,
+        #[serde(rename = "dirtyShortRev")]
+        dirty_short_rev: Option<String>,
+        #[serde(rename = "lastModified")]
+        last_modified: Option<u64>,
     },
     Path {
         path: String,
         #[serde(rename = "narHash")]
         nar_hash: Option<String>,
+        #[serde(rename = "lastModified")]
+        last_modified: Option<u64>,
     },
     Tarball {
         url: String,
@@ -570,8 +580,52 @@ mod tests {
         match myrepo.locked.as_ref().unwrap() {
             LockedRef::Git { url, rev, git_ref, .. } => {
                 assert_eq!(url, "https://example.com/repo.git");
-                assert_eq!(rev, "abc123");
+                assert_eq!(rev, &Some("abc123".to_string()));
                 assert_eq!(git_ref, &Some("main".to_string()));
+            }
+            _ => panic!("expected Git locked ref"),
+        }
+    }
+
+    #[test]
+    fn parse_lock_with_dirty_git_input() {
+        // Test parsing a dirty git input (has dirtyRev instead of rev)
+        let json = r#"{
+            "nodes": {
+                "myrepo": {
+                    "locked": {
+                        "type": "git",
+                        "url": "file:///home/user/code/myrepo",
+                        "dirtyRev": "abc123-dirty",
+                        "dirtyShortRev": "abc123-dirty",
+                        "lastModified": 1700000000,
+                        "narHash": "sha256-xyz"
+                    },
+                    "original": {
+                        "type": "git",
+                        "url": "file:///home/user/code/myrepo"
+                    }
+                },
+                "root": {
+                    "inputs": {
+                        "myrepo": "myrepo"
+                    }
+                }
+            },
+            "root": "root",
+            "version": 7
+        }"#;
+
+        let lock = FlakeLock::parse(json).unwrap();
+        let myrepo = lock.nodes.get("myrepo").unwrap();
+        match myrepo.locked.as_ref().unwrap() {
+            LockedRef::Git { url, rev, dirty_rev, dirty_short_rev, last_modified, nar_hash, .. } => {
+                assert_eq!(url, "file:///home/user/code/myrepo");
+                assert_eq!(rev, &None);
+                assert_eq!(dirty_rev, &Some("abc123-dirty".to_string()));
+                assert_eq!(dirty_short_rev, &Some("abc123-dirty".to_string()));
+                assert_eq!(last_modified, &Some(1700000000));
+                assert_eq!(nar_hash, &Some("sha256-xyz".to_string()));
             }
             _ => panic!("expected Git locked ref"),
         }
