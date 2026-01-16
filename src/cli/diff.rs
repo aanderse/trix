@@ -9,10 +9,10 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use owo_colors::{OwoColorize, Stream::Stdout};
-use tracing::info;
+use tracing::{debug, info, trace};
 
 use crate::eval::Evaluator;
-use crate::flake::{current_system, expand_attribute, resolve_installable, OperationContext};
+use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable, OperationContext};
 use crate::profile::{get_profile_dir_for, parse_generation_number, parse_store_path, Manifest};
 
 #[derive(Args)]
@@ -540,12 +540,30 @@ fn resolve_to_drv(arg: &str) -> Result<String> {
         if is_local {
             let system = current_system()?;
             let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
-            let attr_path = &candidates[0];
+            debug!(?candidates, "expanded attribute candidates");
+
             let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-            let value = eval
-                .eval_flake_attr(&resolved.path, attr_path)
-                .context("failed to evaluate derivation")?;
-            return eval.get_drv_path(&value);
+
+            // Try each candidate until one succeeds
+            for candidate in &candidates {
+                trace!("trying candidate: {}", candidate.join("."));
+                match eval.eval_flake_attr(&resolved.path, candidate) {
+                    Ok(value) => {
+                        debug!(attr = %candidate.join("."), "found attribute");
+                        return eval.get_drv_path(&value);
+                    }
+                    Err(e) => {
+                        trace!("candidate {} failed: {}", candidate.join("."), e);
+                    }
+                }
+            }
+
+            // All candidates failed
+            let canonical = resolved.path
+                .canonicalize()
+                .unwrap_or_else(|_| resolved.path.clone());
+            let flake_url = format!("path:{}", canonical.display());
+            return Err(anyhow!(format_attribute_not_found_error(&flake_url, &candidates)));
         }
     }
 

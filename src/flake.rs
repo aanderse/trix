@@ -393,11 +393,20 @@ pub enum OperationContext {
 impl OperationContext {
     /// Get the ordered list of output categories to search.
     /// Returns None for Eval context (no default categories).
+    ///
+    /// These priorities match nix's behavior (verified empirically):
+    /// - Build: packages > legacyPackages > bare attribute
+    /// - Run: apps > packages > legacyPackages > bare attribute
+    /// - Develop: devShells > devShell (legacy) > packages > bare attribute
+    /// - Check: checks only
+    ///
+    /// When evaluating `flake#attr`, trix tries each category in order with the
+    /// current system inserted (e.g., `packages.x86_64-linux.attr`), falling back
+    /// to the bare attribute if none match.
     fn search_categories(&self) -> Option<&'static [&'static str]> {
         match self {
             OperationContext::Build => Some(&["packages", "legacyPackages"]),
             OperationContext::Run => Some(&["apps", "packages", "legacyPackages"]),
-            // nix develop fallback order: devShells, devShell (legacy), packages
             OperationContext::Develop => Some(&["devShells", "devShell", "packages"]),
             OperationContext::Check => Some(&["checks"]),
             OperationContext::Eval => None,
@@ -962,5 +971,52 @@ mod tests {
     fn format_error_empty_candidates() {
         let msg = format_attribute_not_found_error("path:/foo", &[]);
         assert_eq!(msg, "flake 'path:/foo' has no outputs");
+    }
+
+    // Priority order tests - document that our order matches nix's behavior
+    // These priorities were verified empirically against nix 2.18+
+
+    #[test]
+    fn priority_build_packages_before_legacy() {
+        // For `nix build .#hello`, nix tries packages before legacyPackages.
+        // Verified: create flake with both, nix build chooses packages.
+        let candidates =
+            expand_attribute(&["hello".to_string()], OperationContext::Build, "x86_64-linux");
+        assert_eq!(candidates[0], vec!["packages", "x86_64-linux", "hello"]);
+        assert_eq!(candidates[1], vec!["legacyPackages", "x86_64-linux", "hello"]);
+    }
+
+    #[test]
+    fn priority_build_falls_back_to_bare() {
+        // For `nix build .#hello`, if neither packages nor legacyPackages has it,
+        // nix falls back to the bare attribute at the flake root.
+        // Verified: flake with only `hello = derivation {...}` at root level works.
+        let candidates =
+            expand_attribute(&["hello".to_string()], OperationContext::Build, "x86_64-linux");
+        assert_eq!(candidates.last().unwrap(), &vec!["hello"]);
+    }
+
+    #[test]
+    fn priority_run_apps_before_packages() {
+        // For `nix run .#hello`, nix tries apps before packages.
+        // This allows flakes to define custom app wrappers that override derivations.
+        let candidates =
+            expand_attribute(&["hello".to_string()], OperationContext::Run, "x86_64-linux");
+        assert_eq!(candidates[0], vec!["apps", "x86_64-linux", "hello"]);
+        assert_eq!(candidates[1], vec!["packages", "x86_64-linux", "hello"]);
+        assert_eq!(candidates[2], vec!["legacyPackages", "x86_64-linux", "hello"]);
+    }
+
+    #[test]
+    fn priority_develop_devshells_before_packages() {
+        // For `nix develop .#shell`, nix tries devShells before packages.
+        // This is important because many flakes use packages.default for the main output
+        // but devShells.default for development.
+        let candidates =
+            expand_attribute(&["shell".to_string()], OperationContext::Develop, "x86_64-linux");
+        assert_eq!(candidates[0], vec!["devShells", "x86_64-linux", "shell"]);
+        // devShell is the legacy singular form
+        assert_eq!(candidates[1], vec!["devShell", "x86_64-linux", "shell"]);
+        assert_eq!(candidates[2], vec!["packages", "x86_64-linux", "shell"]);
     }
 }

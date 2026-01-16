@@ -6,11 +6,11 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, trace};
 
 use crate::cli::build::parse_override_inputs;
 use crate::eval::Evaluator;
-use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
+use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
 use crate::progress;
 
 #[derive(Args)]
@@ -70,21 +70,46 @@ pub fn run(args: ShellArgs) -> Result<()> {
         let resolved = resolve_installable_any(installable, &cwd);
         let flake_path = resolved.path.expect("local flake should have path");
         let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
-        let attr_path = &candidates[0];
+        debug!(?candidates, "expanded attribute candidates");
 
-        let eval_target = format!("{}#{}", flake_path.display(), attr_path.join("."));
-        info!("evaluating {}", eval_target);
+        // Try each candidate until one succeeds
+        let (attr_path, value) = {
+            let mut found = None;
 
-        let status = progress::evaluating(&eval_target);
+            for candidate in &candidates {
+                let eval_target = format!("{}#{}", flake_path.display(), candidate.join("."));
+                trace!("trying {}", eval_target);
 
-        // Evaluate using native evaluator
-        let value = if input_overrides.is_empty() {
-            eval.eval_flake_attr(&flake_path, attr_path)
-        } else {
-            eval.eval_flake_attr_with_overrides(&flake_path, attr_path, &input_overrides)
-        }.context(format!("failed to evaluate {}", installable))?;
+                let result = if input_overrides.is_empty() {
+                    eval.eval_flake_attr(&flake_path, candidate)
+                } else {
+                    eval.eval_flake_attr_with_overrides(&flake_path, candidate, &input_overrides)
+                };
 
-        status.finish_and_clear();
+                match result {
+                    Ok(value) => {
+                        info!("evaluating {}", eval_target);
+                        found = Some((candidate.clone(), value));
+                        break;
+                    }
+                    Err(e) => {
+                        trace!("candidate {} failed: {}", candidate.join("."), e);
+                    }
+                }
+            }
+
+            // Build flake URL for error message
+            let canonical = flake_path
+                .canonicalize()
+                .unwrap_or_else(|_| flake_path.clone());
+            let flake_url = format!("path:{}", canonical.display());
+
+            found.ok_or_else(|| {
+                anyhow!(format_attribute_not_found_error(&flake_url, &candidates))
+            })?
+        };
+
+        debug!(attr = %attr_path.join("."), "found attribute");
 
         let drv_path = eval.get_drv_path(&value)?;
         debug!(drv = %drv_path, "got derivation path");

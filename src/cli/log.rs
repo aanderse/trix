@@ -6,10 +6,10 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, trace};
 
 use crate::eval::generate_flake_eval_expr;
-use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
+use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
 
 #[derive(Args)]
 pub struct LogArgs {
@@ -66,28 +66,53 @@ pub fn run(args: LogArgs) -> Result<()> {
 
     // Expand the attribute path and try each candidate
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
-    let attr_path = &candidates[0]; // TODO: try multiple candidates like build.rs
+    debug!(?candidates, "expanded attribute candidates");
 
-    debug!(attr = %attr_path.join("."), "getting derivation path");
-
-    // Generate expression and instantiate to get drv path
     let flake_dir = flake_path
         .to_str()
         .ok_or_else(|| anyhow!("invalid flake path"))?;
-    let expr = generate_flake_eval_expr(flake_dir, lock, &attr_path, &HashMap::new())?;
 
-    let output = Command::new("nix-instantiate")
-        .args(["-E", &expr])
-        .output()
-        .context("failed to run nix-instantiate")?;
+    // Try each candidate until one succeeds
+    let drv_path = {
+        let mut found = None;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("failed to get derivation: {}", stderr.trim()));
-    }
+        for candidate in &candidates {
+            trace!("trying candidate: {}", candidate.join("."));
 
-    let drv_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    debug!(drv = %drv_path, "got derivation path");
+            let expr = match generate_flake_eval_expr(flake_dir, lock, candidate, &HashMap::new()) {
+                Ok(e) => e,
+                Err(e) => {
+                    trace!("candidate {} failed to generate expr: {}", candidate.join("."), e);
+                    continue;
+                }
+            };
+
+            let output = Command::new("nix-instantiate")
+                .args(["-E", &expr])
+                .output()
+                .context("failed to run nix-instantiate")?;
+
+            if output.status.success() {
+                let drv = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                debug!(attr = %candidate.join("."), drv = %drv, "found derivation");
+                found = Some(drv);
+                break;
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                trace!("candidate {} failed: {}", candidate.join("."), stderr.trim());
+            }
+        }
+
+        // Build flake URL for error message
+        let canonical = flake_path
+            .canonicalize()
+            .unwrap_or_else(|_| flake_path.clone());
+        let flake_url = format!("path:{}", canonical.display());
+
+        found.ok_or_else(|| {
+            anyhow!(format_attribute_not_found_error(&flake_url, &candidates))
+        })?
+    };
 
     // Use nix log to show the build log
     let status = Command::new("nix")

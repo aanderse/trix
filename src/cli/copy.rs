@@ -5,10 +5,10 @@ use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, trace};
 
 use crate::eval::Evaluator;
-use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
+use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
 use crate::progress;
 
 #[derive(Args)]
@@ -45,19 +45,42 @@ pub fn run(args: CopyArgs) -> Result<()> {
     // Step 2: Evaluate to get the store path using native evaluation
     let system = current_system()?;
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
-    let attr_path = &candidates[0];
-
-    let eval_target = format!("{}#{}", flake_path.display(), attr_path.join("."));
-    info!("evaluating {}", eval_target);
-
-    let status = progress::evaluating(&eval_target);
+    debug!(?candidates, "expanded attribute candidates");
 
     let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-    let value = eval
-        .eval_flake_attr(&flake_path, attr_path)
-        .context("failed to evaluate derivation")?;
 
-    status.finish_and_clear();
+    // Try each candidate until one succeeds
+    let (attr_path, value) = {
+        let mut found = None;
+
+        for candidate in &candidates {
+            let eval_target = format!("{}#{}", flake_path.display(), candidate.join("."));
+            trace!("trying {}", eval_target);
+
+            match eval.eval_flake_attr(&flake_path, candidate) {
+                Ok(value) => {
+                    info!("evaluating {}", eval_target);
+                    found = Some((candidate.clone(), value));
+                    break;
+                }
+                Err(e) => {
+                    trace!("candidate {} failed: {}", candidate.join("."), e);
+                }
+            }
+        }
+
+        // Build flake URL for error message
+        let canonical = flake_path
+            .canonicalize()
+            .unwrap_or_else(|_| flake_path.clone());
+        let flake_url = format!("path:{}", canonical.display());
+
+        found.ok_or_else(|| {
+            anyhow!(format_attribute_not_found_error(&flake_url, &candidates))
+        })?
+    };
+
+    debug!(attr = %attr_path.join("."), "found attribute");
 
     let drv_path = eval.get_drv_path(&value)?;
     debug!(drv = %drv_path, "got derivation path");

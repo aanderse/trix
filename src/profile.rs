@@ -696,15 +696,28 @@ pub fn upgrade(
                     continue;
                 }
 
-                // Build the attribute path
+                // Build the attribute path - try each candidate
                 let candidates = expand_attribute(
                     &attr.split('.').map(|s| s.to_string()).collect::<Vec<_>>(),
                     OperationContext::Build,
                     &system,
                 );
-                let attr_path = &candidates[0];
 
-                match build_package(&flake_dir, attr_path, input_overrides) {
+                // Try each candidate until one works
+                let mut build_result = None;
+                for candidate in &candidates {
+                    match build_package(&flake_dir, candidate, input_overrides) {
+                        Ok(path) => {
+                            build_result = Some(Ok(path));
+                            break;
+                        }
+                        Err(e) => {
+                            debug!("candidate {} failed: {}", candidate.join("."), e);
+                        }
+                    }
+                }
+
+                match build_result.unwrap_or_else(|| Err(anyhow!("no attribute found"))) {
                     Ok(new_path) => {
                         if new_path != old_path {
                             debug!("upgrading {}: {} -> {}", pkg_name, old_path, new_path);
