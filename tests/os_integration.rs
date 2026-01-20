@@ -632,3 +632,189 @@ fn os_repl_requires_flake_lock() {
         err
     );
 }
+
+// =============================================================================
+// Hostname Validation Tests
+// =============================================================================
+
+/// Create a NixOS flake with multiple configurations for testing validation.
+fn create_multi_config_nixos_flake() -> tempfile::TempDir {
+    let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+    let flake_dir = temp_dir.path();
+
+    let flake_nix = r#"{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
+  outputs = { self, nixpkgs }: {
+    nixosConfigurations.server1 = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [({ ... }: {
+        boot.loader.grub.enable = false;
+        fileSystems."/" = { device = "/dev/null"; fsType = "tmpfs"; };
+        system.stateVersion = "24.05";
+      })];
+    };
+    nixosConfigurations.server2 = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [({ ... }: {
+        boot.loader.grub.enable = false;
+        fileSystems."/" = { device = "/dev/null"; fsType = "tmpfs"; };
+        system.stateVersion = "24.05";
+      })];
+    };
+    nixosConfigurations.desktop = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [({ ... }: {
+        boot.loader.grub.enable = false;
+        fileSystems."/" = { device = "/dev/null"; fsType = "tmpfs"; };
+        system.stateVersion = "24.05";
+      })];
+    };
+  };
+}"#;
+    fs::write(flake_dir.join("flake.nix"), flake_nix).expect("failed to write flake.nix");
+
+    // Lock the flake
+    let nix_lock = Command::new("nix")
+        .args(["flake", "lock"])
+        .current_dir(flake_dir)
+        .output()
+        .expect("failed to run nix flake lock");
+
+    assert!(
+        nix_lock.status.success(),
+        "failed to lock flake: {}",
+        String::from_utf8_lossy(&nix_lock.stderr)
+    );
+
+    temp_dir
+}
+
+#[test]
+fn os_rebuild_fails_with_nonexistent_hostname() {
+    let temp_dir = create_multi_config_nixos_flake();
+    let flake_ref = format!("{}#nonexistent", temp_dir.path().display());
+
+    let result = trix_os_print_expr(&["build", "--flake", &flake_ref]);
+
+    assert!(result.is_err(), "should fail with nonexistent hostname");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("nonexistent") && err.contains("not found"),
+        "error should mention the missing hostname: {}",
+        err
+    );
+}
+
+#[test]
+fn os_rebuild_error_lists_available_configurations() {
+    let temp_dir = create_multi_config_nixos_flake();
+    let flake_ref = format!("{}#nonexistent", temp_dir.path().display());
+
+    let result = trix_os_print_expr(&["build", "--flake", &flake_ref]);
+
+    assert!(result.is_err(), "should fail with nonexistent hostname");
+    let err = result.unwrap_err();
+
+    // Verify all available configurations are listed
+    assert!(
+        err.contains("server1"),
+        "error should list 'server1' as available: {}",
+        err
+    );
+    assert!(
+        err.contains("server2"),
+        "error should list 'server2' as available: {}",
+        err
+    );
+    assert!(
+        err.contains("desktop"),
+        "error should list 'desktop' as available: {}",
+        err
+    );
+    assert!(
+        err.contains("Available configurations"),
+        "error should have 'Available configurations' section: {}",
+        err
+    );
+}
+
+#[test]
+fn os_rebuild_succeeds_with_valid_hostname() {
+    let temp_dir = create_multi_config_nixos_flake();
+
+    // Test each valid hostname
+    for hostname in &["server1", "server2", "desktop"] {
+        let flake_ref = format!("{}#{}", temp_dir.path().display(), hostname);
+        let result = trix_os_print_expr(&["build", "--flake", &flake_ref]);
+        assert!(
+            result.is_ok(),
+            "should succeed with valid hostname '{}': {:?}",
+            hostname,
+            result
+        );
+    }
+}
+
+#[test]
+fn os_repl_fails_with_nonexistent_hostname() {
+    let temp_dir = create_multi_config_nixos_flake();
+    let flake_ref = format!("{}#nonexistent", temp_dir.path().display());
+
+    let result = trix_os_repl_print_expr(&["--flake", &flake_ref]);
+
+    assert!(result.is_err(), "should fail with nonexistent hostname");
+    let err = result.unwrap_err();
+    assert!(
+        err.contains("nonexistent") && err.contains("not found"),
+        "error should mention the missing hostname: {}",
+        err
+    );
+}
+
+#[test]
+fn os_repl_error_lists_available_configurations() {
+    let temp_dir = create_multi_config_nixos_flake();
+    let flake_ref = format!("{}#nonexistent", temp_dir.path().display());
+
+    let result = trix_os_repl_print_expr(&["--flake", &flake_ref]);
+
+    assert!(result.is_err(), "should fail with nonexistent hostname");
+    let err = result.unwrap_err();
+
+    // Verify all available configurations are listed
+    assert!(
+        err.contains("server1"),
+        "error should list 'server1' as available: {}",
+        err
+    );
+    assert!(
+        err.contains("server2"),
+        "error should list 'server2' as available: {}",
+        err
+    );
+    assert!(
+        err.contains("desktop"),
+        "error should list 'desktop' as available: {}",
+        err
+    );
+}
+
+#[test]
+fn os_repl_succeeds_with_valid_hostname() {
+    let temp_dir = create_multi_config_nixos_flake();
+
+    // Test each valid hostname
+    for hostname in &["server1", "server2", "desktop"] {
+        let flake_ref = format!("{}#{}", temp_dir.path().display(), hostname);
+        let result = trix_os_repl_print_expr(&["--flake", &flake_ref]);
+        assert!(
+            result.is_ok(),
+            "should succeed with valid hostname '{}': {:?}",
+            hostname,
+            result
+        );
+    }
+}

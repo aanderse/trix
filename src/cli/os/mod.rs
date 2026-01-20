@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use tracing::{debug, info};
 
 use crate::cli::build::parse_override_inputs;
-use crate::eval::generate_flake_eval_expr;
+use crate::eval::{generate_flake_eval_expr, Evaluator};
 use crate::flake::find_flake_root;
 use crate::lock::FlakeLock;
 
@@ -170,6 +170,9 @@ pub fn run(args: OsArgs) -> Result<()> {
 fn run_rebuild(args: RebuildArgs) -> Result<()> {
     // Parse the flake reference
     let (flake_path, hostname) = parse_flake_ref(&args.flake_ref)?;
+
+    // Validate the hostname exists in nixosConfigurations
+    validate_nixos_config(&flake_path, &hostname)?;
 
     info!(
         flake = %flake_path.display(),
@@ -328,6 +331,9 @@ fn run_repl(args: ReplArgs) -> Result<()> {
     // Flake mode: use our implementation (no store copy)
     let (flake_path, hostname) = parse_flake_ref(&args.flake_ref)?;
 
+    // Validate the hostname exists in nixosConfigurations
+    validate_nixos_config(&flake_path, &hostname)?;
+
     info!(
         flake = %flake_path.display(),
         hostname = %hostname,
@@ -468,4 +474,35 @@ fn handle_exit_status(status: ExitStatus) -> Result<()> {
             None => Err(anyhow!("nixos-rebuild was terminated by signal")),
         }
     }
+}
+
+/// Validate that a hostname exists in the flake's nixosConfigurations.
+/// Returns Ok(()) if valid, or an error with available configurations listed.
+fn validate_nixos_config(flake_path: &std::path::Path, hostname: &str) -> Result<()> {
+    let mut evaluator = Evaluator::new()?;
+
+    // Evaluate just the nixosConfigurations attribute
+    let nixos_configs = evaluator.eval_flake_attr(flake_path, &["nixosConfigurations".to_string()])?;
+
+    // Get the available configuration names
+    let available = evaluator.get_attr_names(&nixos_configs)?;
+
+    if available.contains(&hostname.to_string()) {
+        return Ok(());
+    }
+
+    // Build helpful error message
+    if available.is_empty() {
+        return Err(anyhow!(
+            "flake at '{}' has no nixosConfigurations",
+            flake_path.display()
+        ));
+    }
+
+    let available_list = available.join(", ");
+    Err(anyhow!(
+        "nixosConfigurations.{} not found in flake\n\nAvailable configurations: {}",
+        hostname,
+        available_list
+    ))
 }
