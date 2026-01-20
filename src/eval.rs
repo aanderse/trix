@@ -1016,15 +1016,21 @@ fn generate_input_build_expr(
 
     let inputs_str = input_exprs.join(" ");
 
+    // Get metadata (rev, shortRev, lastModified, lastModifiedDate) from locked ref
+    let metadata = node.locked.as_ref()
+        .map(|l| get_locked_ref_metadata(l))
+        .unwrap_or_default();
+
     Ok(format!(
         r#"let
     _flake = import ({src} + "/flake.nix");
     _inputs = {{ {inputs} }};
-    _self = {{ outPath = {src}; inputs = _inputs; _type = "flake"; }};
+    _self = {{ outPath = {src}; inputs = _inputs; _type = "flake";{metadata} }};
     _outputs = _flake.outputs (_inputs // {{ self = _self // _outputs; }});
-  in _outputs // {{ outPath = {src}; inputs = _inputs; outputs = _outputs; _type = "flake"; }}"#,
+  in _outputs // {{ outPath = {src}; inputs = _inputs; outputs = _outputs; _type = "flake";{metadata} }}"#,
         src = src_name,
         inputs = inputs_str,
+        metadata = metadata,
     ))
 }
 
@@ -1153,6 +1159,48 @@ fn sanitize_name(name: &str) -> String {
     // Replace hyphens and other special chars with underscores for variable names
     // But keep original for attribute access
     name.replace('-', "_")
+}
+
+/// Extract metadata (rev, shortRev, lastModified, lastModifiedDate) from a LockedRef.
+/// Returns Nix attribute syntax for these attributes.
+fn get_locked_ref_metadata(locked: &crate::lock::LockedRef) -> String {
+    use crate::lock::LockedRef;
+
+    let (rev_opt, last_modified_opt) = match locked {
+        LockedRef::GitHub { rev, last_modified, .. } => (Some(rev.clone()), *last_modified),
+        LockedRef::GitLab { rev, .. } => (Some(rev.clone()), None),
+        LockedRef::Sourcehut { rev, .. } => (Some(rev.clone()), None),
+        LockedRef::Git { rev, dirty_rev, last_modified, .. } => {
+            // Prefer clean rev, fall back to dirty_rev
+            let effective_rev = rev.as_ref().or(dirty_rev.as_ref()).cloned();
+            (effective_rev, *last_modified)
+        }
+        LockedRef::Path { last_modified, .. } => (None, *last_modified),
+        LockedRef::Tarball { .. } | LockedRef::Indirect { .. } => (None, None),
+    };
+
+    let mut attrs = Vec::new();
+
+    if let Some(rev) = rev_opt {
+        let short_rev = &rev[..7.min(rev.len())];
+        attrs.push(format!(r#"rev = "{}";"#, rev));
+        attrs.push(format!(r#"shortRev = "{}";"#, short_rev));
+    }
+
+    if let Some(ts) = last_modified_opt {
+        attrs.push(format!("lastModified = {};", ts));
+        // Format lastModifiedDate as YYYYMMDD
+        let datetime = chrono::DateTime::from_timestamp(ts as i64, 0)
+            .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
+        let date_str = datetime.format("%Y%m%d").to_string();
+        attrs.push(format!(r#"lastModifiedDate = "{}";"#, date_str));
+    }
+
+    if attrs.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", attrs.join(" "))
+    }
 }
 
 /// Get git metadata for a directory without copying to the nix store.
