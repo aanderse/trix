@@ -341,10 +341,10 @@ fn os_rebuild_expr_fetches_remote_inputs() {
 
     let expr = result.unwrap();
 
-    // Verify nixpkgs is fetched via builtins.fetchTarball (this is fine for remote inputs)
+    // Verify nixpkgs is fetched via builtins.fetchTree (respects access-tokens for private repos)
     assert!(
-        expr.contains("builtins.fetchTarball"),
-        "Expression should fetch remote inputs via builtins.fetchTarball"
+        expr.contains("builtins.fetchTree"),
+        "Expression should fetch remote inputs via builtins.fetchTree"
     );
 
     assert!(

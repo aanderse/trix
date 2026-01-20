@@ -391,25 +391,20 @@ pub fn parse_installable_for_profile(installable: &str) -> (String, String, Stri
 
 /// Build a package and return its store path.
 /// Uses native evaluation.
-fn build_package(
+/// Try to evaluate and build a package candidate.
+/// Returns (attr_path, store_path) on success.
+fn try_build_candidate(
+    eval: &mut Evaluator,
     flake_dir: &Path,
     attr_path: &[String],
     input_overrides: &HashMap<String, String>,
 ) -> Result<String> {
-    let eval_target = format!("{}#{}", flake_dir.display(), attr_path.join("."));
-    info!("evaluating {}", eval_target);
-
-    let status = progress::evaluating(&eval_target);
-
-    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
     let value = if input_overrides.is_empty() {
         eval.eval_flake_attr(flake_dir, attr_path)
     } else {
         eval.eval_flake_attr_with_overrides(flake_dir, attr_path, input_overrides)
     }
     .context("failed to evaluate derivation")?;
-
-    status.finish_and_clear();
 
     let drv_path = eval.get_drv_path(&value)?;
     debug!(drv = %drv_path, "got derivation path");
@@ -456,17 +451,26 @@ pub fn install(
             format!("path:{}", canonical.display())
         };
 
+        // Initialize evaluator once and reuse for all candidates
+        let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
+
         // Try each candidate until one works (like build.rs does)
         let (attr_path, store_path) = {
             let mut found = None;
 
             for candidate in &candidates {
-                match build_package(flake_path, candidate, input_overrides) {
+                let eval_target = format!("{}#{}", flake_path.display(), candidate.join("."));
+                info!("evaluating {}", eval_target);
+                let status = progress::evaluating(&eval_target);
+
+                match try_build_candidate(&mut eval, flake_path, candidate, input_overrides) {
                     Ok(path) => {
+                        status.finish_and_clear();
                         found = Some((candidate.clone(), path));
                         break;
                     }
                     Err(e) => {
+                        status.finish_and_clear();
                         debug!("candidate {} failed: {}", candidate.join("."), e);
                     }
                 }
@@ -703,10 +707,20 @@ pub fn upgrade(
                     &system,
                 );
 
+                // Initialize evaluator once for this package
+                let mut eval = match Evaluator::new() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        eprintln!("warning: failed to initialize evaluator for {}: {}", pkg_name, e);
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
                 // Try each candidate until one works
                 let mut build_result = None;
                 for candidate in &candidates {
-                    match build_package(&flake_dir, candidate, input_overrides) {
+                    match try_build_candidate(&mut eval, &flake_dir, candidate, input_overrides) {
                         Ok(path) => {
                             build_result = Some(Ok(path));
                             break;

@@ -63,6 +63,12 @@ impl Evaluator {
         trace!("opening Nix store");
         let store = Store::open(None, HashMap::new()).context("failed to open Nix store")?;
 
+        // Enable experimental features needed for flakes and fetchTree
+        trace!("setting experimental-features");
+        if let Err(e) = nix_bindings_util::settings::set("experimental-features", "nix-command flakes fetch-tree") {
+            debug!("failed to set experimental-features (non-fatal): {:?}", e);
+        }
+
         // Disable pure evaluation mode to allow adding paths to store during evaluation.
         // Without this, derivationStrict fails with "path not valid" for local paths.
         trace!("setting pure-eval to false");
@@ -919,32 +925,36 @@ in outputs{attr_suffix}
 }
 
 /// Generate a Nix fetch expression for a locked reference.
+/// Uses builtins.fetchTree for GitHub/GitLab/Sourcehut to respect access-tokens in nix.conf.
 fn generate_fetch_expr(locked: &LockedRef, flake_dir: &str) -> String {
     match locked {
         LockedRef::GitHub { owner, repo, rev, nar_hash, .. } => {
+            // Use fetchTree with type=github to respect access-tokens for private repos
             let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" sha256 = \"{}\";", h))
+                .map(|h| format!(" narHash = \"{}\";", h))
                 .unwrap_or_default();
             format!(
-                r#"builtins.fetchTarball {{ url = "https://github.com/{}/{}/archive/{}.tar.gz";{} }}"#,
+                r#"builtins.fetchTree {{ type = "github"; owner = "{}"; repo = "{}"; rev = "{}";{} }}"#,
                 owner, repo, rev, hash_arg
             )
         }
         LockedRef::GitLab { owner, repo, rev, nar_hash, .. } => {
+            // Use fetchTree with type=gitlab to respect access-tokens for private repos
             let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" sha256 = \"{}\";", h))
+                .map(|h| format!(" narHash = \"{}\";", h))
                 .unwrap_or_default();
             format!(
-                r#"builtins.fetchTarball {{ url = "https://gitlab.com/{}/{}/-/archive/{}/{}-{}.tar.gz";{} }}"#,
-                owner, repo, rev, repo, rev, hash_arg
+                r#"builtins.fetchTree {{ type = "gitlab"; owner = "{}"; repo = "{}"; rev = "{}";{} }}"#,
+                owner, repo, rev, hash_arg
             )
         }
         LockedRef::Sourcehut { owner, repo, rev, nar_hash, .. } => {
+            // Use fetchTree with type=sourcehut to respect access-tokens for private repos
             let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" sha256 = \"{}\";", h))
+                .map(|h| format!(" narHash = \"{}\";", h))
                 .unwrap_or_default();
             format!(
-                r#"builtins.fetchTarball {{ url = "https://git.sr.ht/~{}/{}/archive/{}.tar.gz";{} }}"#,
+                r#"builtins.fetchTree {{ type = "sourcehut"; owner = "{}"; repo = "{}"; rev = "{}";{} }}"#,
                 owner, repo, rev, hash_arg
             )
         }
