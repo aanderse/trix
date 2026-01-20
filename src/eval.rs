@@ -1055,11 +1055,16 @@ fn topological_sort_nodes(lock: &FlakeLock) -> Result<Vec<String>> {
                 let dep_name = match input_ref {
                     InputRef::Direct(name) => name.clone(),
                     InputRef::Follows(path) => {
-                        // For follows, we need to resolve to find the actual node
-                        if let Some(first) = path.first() {
-                            first.clone()
-                        } else {
-                            continue;
+                        // For follows, resolve the full path to find the actual target node
+                        // e.g., ["infra-private", "nixpkgs"] should resolve to the "nixpkgs" node,
+                        // not "infra-private"
+                        if path.is_empty() {
+                            continue; // Empty follows = self/root, no dependency to add
+                        }
+                        match resolve_follows_to_node_name(path, lock) {
+                            Ok(Some(name)) => name,
+                            Ok(None) => continue, // Unresolvable or self-reference
+                            Err(_) => continue,   // Skip on resolution errors
                         }
                     }
                 };
@@ -1086,6 +1091,29 @@ fn topological_sort_nodes(lock: &FlakeLock) -> Result<Vec<String>> {
     }
 
     Ok(sorted)
+}
+
+/// Resolve a follows path to the original node name (not sanitized).
+/// Returns None for empty paths (self-reference) or if resolution fails gracefully.
+/// Used by topological sort to find actual dependencies.
+fn resolve_follows_to_node_name(path: &[String], lock: &FlakeLock) -> Result<Option<String>> {
+    if path.is_empty() {
+        return Ok(None); // Empty follows = self/root
+    }
+
+    let mut current = lock.root.clone();
+    for segment in path {
+        let node = lock.nodes.get(&current)
+            .ok_or_else(|| anyhow!("node '{}' not found", current))?;
+        match node.inputs.get(segment) {
+            Some(InputRef::Direct(name)) => current = name.clone(),
+            Some(InputRef::Follows(inner_path)) => {
+                return resolve_follows_to_node_name(inner_path, lock);
+            }
+            None => return Ok(None), // Input not found, skip gracefully
+        }
+    }
+    Ok(Some(current))
 }
 
 /// Resolve a follows path to a node name.
