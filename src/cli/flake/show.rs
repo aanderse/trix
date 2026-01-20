@@ -250,7 +250,8 @@ fn build_output_tree(
     let mut result = BTreeMap::new();
     let outputs = evaluator.get_attr_names(flake)?;
 
-    for output_name in outputs.iter().filter(|n| is_known_output(n)) {
+    // Show ALL outputs, not just known ones (nix flake show shows unknown outputs too)
+    for output_name in &outputs {
         if let Some(output_value) = evaluator.get_attr(flake, output_name)? {
             if let Some(node) = build_output_node(
                 evaluator,
@@ -279,6 +280,15 @@ fn build_output_node(
     show_legacy: bool,
     depth: usize,
 ) -> Result<Option<OutputNode>> {
+    // At depth 0 (top-level outputs), treat unknown outputs as opaque
+    // This matches nix flake show behavior
+    if depth == 0 && !is_known_output(output_name) {
+        return Ok(Some(OutputNode::Opaque {
+            output_category: output_name.to_string(),
+            description: None,
+        }));
+    }
+
     // Handle legacyPackages specially - show "omitted (use --legacy to show)" unless --legacy
     if output_name == "legacyPackages" && !show_legacy {
         if evaluator.is_attrs(value)? {
