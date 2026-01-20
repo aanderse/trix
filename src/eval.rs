@@ -51,6 +51,18 @@ impl Evaluator {
     pub fn new() -> Result<Self> {
         debug!("initializing Nix evaluator");
 
+        // Initialize the Nix utility library first - this loads nix.conf settings
+        // including access-tokens for private repository authentication.
+        // Without this, fetchers won't have access to configured tokens.
+        trace!("calling libutil_init()");
+        unsafe {
+            let mut ctx = nix_bindings_util::context::Context::new();
+            let err = nix_bindings_util::raw_sys::libutil_init(ctx.ptr());
+            if err != 0 {
+                debug!("libutil_init returned error code: {}", err);
+            }
+        }
+
         // Initialize the Nix library
         trace!("calling nix init()");
         init().context("failed to initialize Nix")?;
