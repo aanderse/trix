@@ -17,9 +17,9 @@ use tempfile::TempDir;
 use tracing::{debug, info};
 
 use crate::cli::build::parse_override_inputs;
-use crate::eval::{generate_flake_eval_expr, Evaluator};
+use crate::eval::{self, generate_flake_eval_expr};
 use crate::flake::find_flake_root;
-use crate::lock::FlakeLock;
+use crate::lock;
 
 #[derive(Args)]
 pub struct OsArgs {
@@ -182,17 +182,7 @@ fn run_rebuild(args: RebuildArgs) -> Result<()> {
     );
 
     // Read the flake.lock
-    let lock_path = flake_path.join("flake.lock");
-    let lock: FlakeLock = if lock_path.exists() {
-        let content =
-            std::fs::read_to_string(&lock_path).context("failed to read flake.lock")?;
-        serde_json::from_str(&content).context("failed to parse flake.lock")?
-    } else {
-        return Err(anyhow!(
-            "flake.lock not found at {}. Run 'trix flake lock' first.",
-            lock_path.display()
-        ));
-    };
+    let lock = lock::read_flake_lock(&flake_path)?;
 
     // Generate the Nix expression
     let flake_dir_str = flake_path
@@ -213,7 +203,27 @@ fn run_rebuild(args: RebuildArgs) -> Result<()> {
         hostname.clone(),
     ];
 
-    let expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path, &input_overrides)?;
+    // Prefetch inputs
+    let store_paths = if input_overrides.is_empty() {
+        eval::prefetch_all_inputs(&lock)?
+    } else {
+        let nodes_to_fetch: Vec<_> = lock
+            .nodes
+            .iter()
+            .filter(|(name, _)| *name != &lock.root && !input_overrides.contains_key(*name))
+            .collect();
+
+        let mut paths = std::collections::HashMap::new();
+        for (name, node) in nodes_to_fetch {
+            if let Some(ref locked) = node.locked {
+                let store_path = eval::prefetch_input(name, locked)?;
+                paths.insert(name.clone(), store_path);
+            }
+        }
+        paths
+    };
+
+    let expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path, &input_overrides, &store_paths)?;
 
     // Add timestamp header for debugging
     let expr_with_header = format!(
@@ -341,17 +351,7 @@ fn run_repl(args: ReplArgs) -> Result<()> {
     );
 
     // Read the flake.lock
-    let lock_path = flake_path.join("flake.lock");
-    let lock: FlakeLock = if lock_path.exists() {
-        let content =
-            std::fs::read_to_string(&lock_path).context("failed to read flake.lock")?;
-        serde_json::from_str(&content).context("failed to parse flake.lock")?
-    } else {
-        return Err(anyhow!(
-            "flake.lock not found at {}. Run 'trix flake lock' first.",
-            lock_path.display()
-        ));
-    };
+    let lock = lock::read_flake_lock(&flake_path)?;
 
     // Generate the Nix expression for the NixOS configuration
     let flake_dir_str = flake_path
@@ -370,7 +370,27 @@ fn run_repl(args: ReplArgs) -> Result<()> {
         hostname.clone(),
     ];
 
-    let base_expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path, &input_overrides)?;
+    // Prefetch inputs
+    let store_paths = if input_overrides.is_empty() {
+        eval::prefetch_all_inputs(&lock)?
+    } else {
+        let nodes_to_fetch: Vec<_> = lock
+            .nodes
+            .iter()
+            .filter(|(name, _)| *name != &lock.root && !input_overrides.contains_key(*name))
+            .collect();
+
+        let mut paths = std::collections::HashMap::new();
+        for (name, node) in nodes_to_fetch {
+            if let Some(ref locked) = node.locked {
+                let store_path = eval::prefetch_input(name, locked)?;
+                paths.insert(name.clone(), store_path);
+            }
+        }
+        paths
+    };
+
+    let base_expr = generate_flake_eval_expr(flake_dir_str, &lock, &attr_path, &input_overrides, &store_paths)?;
 
     // Wrap the expression to expose config, options, pkgs, lib like nixos-rebuild repl does
     let repl_expr = format!(
@@ -479,13 +499,38 @@ fn handle_exit_status(status: ExitStatus) -> Result<()> {
 /// Validate that a hostname exists in the flake's nixosConfigurations.
 /// Returns Ok(()) if valid, or an error with available configurations listed.
 fn validate_nixos_config(flake_path: &std::path::Path, hostname: &str) -> Result<()> {
-    let mut evaluator = Evaluator::new()?;
+    // Use nix eval with a minimal expression to get config names.
+    // We pass fake inputs since Nix is lazy - attrNames only needs the keys,
+    // not the values (which would require real nixpkgs).
+    let flake_dir = flake_path.to_str()
+        .ok_or_else(|| anyhow!("invalid flake path"))?;
 
-    // Evaluate just the nixosConfigurations attribute
-    let nixos_configs = evaluator.eval_flake_attr(flake_path, &["nixosConfigurations".to_string()])?;
+    let expr = format!(
+        r#"builtins.toJSON (let
+  flake = import ((toString "{flake_dir}") + "/flake.nix");
+  fakeInputs = builtins.listToAttrs (map (name: {{ inherit name; value = {{}}; }}) (builtins.attrNames (builtins.functionArgs flake.outputs)));
+  outputs = flake.outputs fakeInputs;
+in builtins.attrNames (outputs.nixosConfigurations or {{}}))"#,
+        flake_dir = flake_dir,
+    );
 
-    // Get the available configuration names
-    let available = evaluator.get_attr_names(&nixos_configs)?;
+    let output = Command::new("nix")
+        .args(["eval", "--raw", "--impure", "--expr", &expr])
+        .output()
+        .context("failed to run nix eval")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "failed to evaluate nixosConfigurations: {}",
+            stderr.trim()
+        ));
+    }
+
+    // --raw gives us the unquoted string directly
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let available: Vec<String> = serde_json::from_str(raw.trim())
+        .context("failed to parse nixosConfigurations list")?;
 
     if available.contains(&hostname.to_string()) {
         return Ok(());

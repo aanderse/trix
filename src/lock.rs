@@ -17,6 +17,24 @@ pub struct FlakeLock {
     pub version: u32,
 }
 
+impl FlakeLock {
+    /// Create an empty lock (for flakes with no inputs).
+    pub fn empty() -> Self {
+        let mut nodes = HashMap::new();
+        nodes.insert("root".to_string(), LockNode {
+            inputs: HashMap::new(),
+            locked: None,
+            original: None,
+            flake: true,
+        });
+        FlakeLock {
+            nodes,
+            root: "root".to_string(),
+            version: 7,
+        }
+    }
+}
+
 /// A node in the lock graph
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LockNode {
@@ -385,6 +403,38 @@ impl FlakeLock {
             }
         }
     }
+}
+
+//=============================================================================
+// Helper Functions
+//=============================================================================
+
+/// Read and parse a flake.lock file from a flake directory.
+///
+/// This is a convenience helper to reduce code duplication across commands.
+/// Returns an error if the file doesn't exist or can't be parsed.
+pub fn read_flake_lock(flake_path: &std::path::Path) -> anyhow::Result<FlakeLock> {
+    use anyhow::Context;
+
+    let lock_path = flake_path.join("flake.lock");
+
+    // Read the file - using match to avoid TOCTOU race condition
+    let content = match std::fs::read_to_string(&lock_path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "flake.lock not found at {} - run 'trix flake lock' first",
+                lock_path.display()
+            );
+        }
+        Err(e) => {
+            return Err(e).context(format!("failed to read {}", lock_path.display()));
+        }
+    };
+
+    // Parse the JSON
+    serde_json::from_str(&content)
+        .context(format!("failed to parse {}", lock_path.display()))
 }
 
 #[cfg(test)]

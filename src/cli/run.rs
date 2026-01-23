@@ -9,8 +9,9 @@ use clap::Args;
 use tracing::{debug, info, instrument};
 
 use crate::cli::build::parse_override_inputs;
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext, ResolvedInstallable};
+use crate::lock;
 use crate::progress;
 
 #[derive(Args)]
@@ -54,12 +55,13 @@ pub fn run(args: RunArgs) -> Result<()> {
         "resolved flake"
     );
 
-    // Step 3: Get candidate attribute paths (apps, packages, legacyPackages)
+    // Step 3: Read flake.lock (missing lock is OK for flakes with no inputs)
+    let lock = lock::read_flake_lock(flake_path).unwrap_or_else(|_| lock::FlakeLock::empty());
+
+    // Step 4: Get candidate attribute paths (apps, packages, legacyPackages)
     let system = current_system()?;
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Run, &system);
     debug!(?candidates, "expanded attribute candidates");
-
-    let mut evaluator = Evaluator::new().context("failed to initialize Nix evaluator")?;
 
     // Parse override inputs
     let input_overrides = parse_override_inputs(&args.override_input);
@@ -68,20 +70,55 @@ pub fn run(args: RunArgs) -> Result<()> {
     }
 
     // Try each candidate until one succeeds
-    let (attr_path, value) = {
+    let (_attr_path, exe_path) = {
         let mut last_err = None;
         let mut found = None;
 
         for candidate in &candidates {
-            let result = if input_overrides.is_empty() {
-                evaluator.eval_flake_attr(flake_path, candidate)
-            } else {
-                evaluator.eval_flake_attr_with_overrides(flake_path, candidate, &input_overrides)
-            };
+            // First, try to get it as an app (has .program attribute)
+            if let Ok(Some(program_path)) = eval::try_get_app_program(
+                flake_path,
+                &lock,
+                candidate,
+                &input_overrides,
+            ) {
+                info!("running app at {}", candidate.join("."));
+                found = Some((candidate.clone(), program_path));
+                break;
+            }
+
+            // Otherwise, treat as a package - evaluate to drv and build
+            let result = eval::generate_and_eval_local_flake(
+                flake_path,
+                &lock,
+                candidate,
+                &input_overrides,
+            );
+
             match result {
-                Ok(value) => {
-                    debug!(attr = %candidate.join("."), "found attribute");
-                    found = Some((candidate.clone(), value));
+                Ok(drv_path) => {
+                    debug!(attr = %candidate.join("."), drv = %drv_path, "found package");
+
+                    info!("building {}", candidate.join("."));
+                    let build_status = progress::building(&drv_path);
+
+                    let store_path = eval::build_drv(&drv_path)
+                        .context("build failed")?;
+
+                    build_status.finish_and_clear();
+
+                    // Get the main program name
+                    let attr_name = resolved.attribute.last().map(|s| s.as_str()).unwrap_or("default");
+                    let main_program = eval::get_main_program(
+                        flake_path,
+                        &lock,
+                        candidate,
+                        &input_overrides,
+                        attr_name,
+                    )?;
+
+                    let exe_path = format!("{}/bin/{}", store_path, main_program);
+                    found = Some((candidate.clone(), exe_path));
                     break;
                 }
                 Err(e) => {
@@ -94,30 +131,6 @@ pub fn run(args: RunArgs) -> Result<()> {
         found.ok_or_else(|| {
             last_err.unwrap_or_else(|| anyhow!("no runnable attribute found"))
         })?
-    };
-
-    // Determine how to run based on the value (app vs derivation)
-    let exe_path = if let Some(program) = evaluator.get_attr(&value, "program")? {
-        // It's an app - get the program path directly
-        info!("running app at {}", attr_path.join("."));
-        evaluator.require_string(&program)?
-    } else {
-        // It's a derivation - build and find executable
-        let attr_name = resolved.attribute.last().map(|s| s.as_str()).unwrap_or("default");
-
-        let drv_path = evaluator.get_drv_path(&value)?;
-        debug!(drv = %drv_path, "got derivation path");
-
-        info!("building {}", attr_path.join("."));
-        let build_status = progress::building(&drv_path);
-
-        let store_path = evaluator.build_value(&value)?;
-
-        build_status.finish_and_clear();
-
-        // Get the main program name
-        let main_program = evaluator.get_main_program(&value, attr_name)?;
-        format!("{}/bin/{}", store_path, main_program)
     };
 
     // Run the executable
@@ -149,6 +162,7 @@ fn run_remote(args: &RunArgs, resolved: &ResolvedInstallable) -> Result<()> {
     info!("running {} (remote, delegating to nix)", full_ref);
 
     let mut cmd = Command::new("nix");
+    cmd.args(["--extra-experimental-features", "nix-command flakes"]);
     cmd.arg("run").arg(&full_ref);
 
     // Add -- separator and program args

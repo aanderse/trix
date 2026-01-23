@@ -1,17 +1,21 @@
 //! Eval command - evaluate Nix expressions.
+//!
+//! For local flakes, evaluates WITHOUT copying to store (core value proposition).
+//! For remote flakes and --expr/--file modes, delegates to `nix eval`.
 
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Args;
-use nix_bindings_expr::value::ValueType;
+use tracing::{debug, instrument};
 
 use crate::cli::build::parse_override_inputs;
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, resolve_installable_any};
-use crate::progress;
+use crate::lock;
 
 #[derive(Args)]
 pub struct EvalArgs {
@@ -59,6 +63,7 @@ pub struct EvalArgs {
     pub apply: Option<String>,
 }
 
+#[instrument(level = "debug", skip(args))]
 pub fn run(args: EvalArgs) -> Result<()> {
     // Validate: --arg and --argstr require --file or --expr
     let has_args = !args.arg.is_empty() || !args.argstr.is_empty();
@@ -68,240 +73,218 @@ pub fn run(args: EvalArgs) -> Result<()> {
         ));
     }
 
-    let status = progress::evaluating(&args.installable);
-    let mut evaluator = Evaluator::new().context("failed to initialize Nix evaluator")?;
+    // For --expr and --file modes, delegate to nix eval (no flakes involved)
+    if args.expr.is_some() || args.file.is_some() {
+        return run_nix_eval_delegation(&args);
+    }
+
+    // Default mode: evaluate flake reference
+    // Check if it's local or remote
+    let cwd = env::current_dir().context("failed to get current directory")?;
+    let resolved = resolve_installable_any(&args.installable, &cwd);
+
+    if resolved.is_local {
+        // Local flake - evaluate without copying to store
+        debug!("evaluating local flake without store copy");
+        run_local_flake_eval(&args, &resolved)
+    } else {
+        // Remote flake - delegate to nix eval
+        debug!("delegating remote flake to nix eval");
+        run_nix_eval_delegation(&args)
+    }
+}
+
+/// Evaluate a local flake without copying to store.
+fn run_local_flake_eval(
+    args: &EvalArgs,
+    resolved: &crate::flake::ResolvedInstallable,
+) -> Result<()> {
+    let flake_path = resolved
+        .path
+        .as_ref()
+        .ok_or_else(|| anyhow!("local flake must have path"))?;
+
+    // Read flake.lock - if missing, use empty lock (flake may have no inputs)
+    let lock = match lock::read_flake_lock(flake_path) {
+        Ok(l) => l,
+        Err(_) => {
+            debug!("no flake.lock found, using empty lock");
+            lock::FlakeLock::empty()
+        }
+    };
 
     // Parse override inputs
     let input_overrides = parse_override_inputs(&args.override_input);
-    if !input_overrides.is_empty() {
-        use tracing::debug;
-        debug!(?input_overrides, "using input overrides");
+
+    // Expand attribute path with system
+    let system = current_system()?;
+    let candidates = expand_eval_attr_path(&resolved.attribute, &system);
+    debug!(?candidates, "expanded attribute candidates");
+
+    // Try each candidate until one succeeds
+    let mut last_result = None;
+    for candidate in &candidates {
+        debug!("trying candidate: {}", candidate.join("."));
+
+        // Generate expression that evaluates the flake attribute
+        let flake_dir = flake_path
+            .to_str()
+            .ok_or_else(|| anyhow!("invalid flake path"))?;
+
+        // Prefetch inputs
+        let store_paths = if input_overrides.is_empty() {
+            eval::prefetch_all_inputs(&lock)?
+        } else {
+            let nodes_to_fetch: Vec<_> = lock
+                .nodes
+                .iter()
+                .filter(|(name, _)| *name != &lock.root && !input_overrides.contains_key(*name))
+                .collect();
+
+            let mut paths = HashMap::new();
+            for (name, node) in nodes_to_fetch {
+                if let Some(ref locked) = node.locked {
+                    let store_path = eval::prefetch_input(name, locked)?;
+                    paths.insert(name.clone(), store_path);
+                }
+            }
+            paths
+        };
+
+        // Generate expression
+        let expr = eval::generate_flake_eval_expr(
+            flake_dir,
+            &lock,
+            candidate,
+            &input_overrides,
+            &store_paths,
+        )?;
+
+        // Apply function if --apply specified
+        let final_expr = if let Some(ref apply_expr) = args.apply {
+            format!("({}) ({})", apply_expr, expr)
+        } else {
+            expr
+        };
+
+        // Evaluate the expression
+        let result = if args.json {
+            eval::eval_to_json(&final_expr)
+        } else {
+            // For non-JSON, use nix eval for proper Nix formatting
+            let nix_args = if args.raw {
+                vec!["eval", "--raw", "--impure", "--expr", &final_expr]
+            } else {
+                vec!["eval", "--impure", "--expr", &final_expr]
+            };
+
+            let output = Command::new("nix")
+                .args(&nix_args)
+                .output()
+                .context("failed to execute nix eval")?;
+
+            if output.status.success() {
+                let result = String::from_utf8_lossy(&output.stdout).to_string();
+                Ok(serde_json::Value::String(result))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(anyhow!("evaluation failed: {}", stderr.trim()))
+            }
+        };
+
+        match result {
+            Ok(json_value) => {
+                // Output the result
+                if args.json {
+                    println!("{}", serde_json::to_string(&json_value)?);
+                } else if let serde_json::Value::String(s) = json_value {
+                    // Already formatted by nix eval
+                    print!("{}", s);
+                } else {
+                    println!("{}", serde_json::to_string(&json_value)?);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                debug!("candidate {} failed: {}", candidate.join("."), e);
+                last_result = Some(Err(e));
+            }
+        }
     }
 
-    // Build args expression if needed
-    let args_expr = build_args_expr(&args.arg, &args.argstr)?;
+    // All candidates failed
+    last_result.unwrap_or_else(|| Err(anyhow!("no valid attribute path found")))
+}
 
-    // Determine what to evaluate
-    let value = if let Some(ref expr) = args.expr {
-        // --expr: evaluate the expression directly
-        // If args are provided, wrap in a let binding that applies them
-        let full_expr = if let Some(ref args_expr) = args_expr {
-            format!(
-                "let _f = {}; _args = {}; in if builtins.isFunction _f then _f _args else _f",
-                expr, args_expr
-            )
-        } else {
-            expr.clone()
-        };
+/// Delegate to nix eval for --expr, --file, or remote flakes.
+fn run_nix_eval_delegation(args: &EvalArgs) -> Result<()> {
+    let mut cmd = Command::new("nix");
+    cmd.args(["--extra-experimental-features", "nix-command flakes"]);
+    cmd.arg("eval");
 
-        let base_value = evaluator.eval_string(&full_expr, "<cmdline>")?;
-
+    // Handle --expr mode
+    if let Some(ref expr) = args.expr {
+        cmd.arg("--expr").arg(expr);
         if args.installable != "." && !args.installable.is_empty() {
-            // Parse attribute path from installable
-            let attr_path: Vec<String> = args
-                .installable
-                .split('.')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-            evaluator.navigate_attr_path(base_value, &attr_path)?
-        } else {
-            base_value
+            // Navigate to attribute path
+            let attr_path = format!(".{}", args.installable);
+            cmd.arg("--apply").arg(format!("x: x{}", attr_path));
         }
     } else if let Some(ref file) = args.file {
-        // --file: evaluate file and navigate to attribute path
-        // If args are provided, apply them to the result if it's a function
-        let file_path = file
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid file path"))?;
-
-        let full_expr = if let Some(ref args_expr) = args_expr {
-            format!(
-                "let _f = import {}; _args = {}; in if builtins.isFunction _f then _f _args else _f",
-                file_path, args_expr
-            )
-        } else {
-            format!("import {}", file_path)
-        };
-
-        let base_value = evaluator.eval_string(&full_expr, "<file>")?;
-
+        // Handle --file mode
+        cmd.arg("--file").arg(file);
         if args.installable != "." && !args.installable.is_empty() {
-            let attr_path: Vec<String> = args
-                .installable
-                .split('.')
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-            evaluator.navigate_attr_path(base_value, &attr_path)?
-        } else {
-            base_value
+            cmd.arg(&args.installable);
         }
     } else {
-        // Default: evaluate as installable (flake reference)
-        eval_installable(&mut evaluator, &args.installable, &input_overrides)?
-    };
+        // Default: flake reference (remote)
+        cmd.arg(&args.installable);
+    }
 
-    // Apply function if --apply is specified
-    let value = if let Some(ref apply_expr) = args.apply {
-        let func = evaluator.eval_string(apply_expr, "<apply>")?;
-        evaluator.apply(func, value)?
-    } else {
-        value
-    };
+    // Add --arg and --argstr pairs
+    for chunk in args.arg.chunks(2) {
+        if chunk.len() == 2 {
+            cmd.arg("--arg").arg(&chunk[0]).arg(&chunk[1]);
+        }
+    }
 
-    status.finish_and_clear();
+    for chunk in args.argstr.chunks(2) {
+        if chunk.len() == 2 {
+            cmd.arg("--argstr").arg(&chunk[0]).arg(&chunk[1]);
+        }
+    }
 
-    // Output the result
+    // Add --override-input pairs
+    for chunk in args.override_input.chunks(2) {
+        if chunk.len() == 2 {
+            cmd.arg("--override-input").arg(&chunk[0]).arg(&chunk[1]);
+        }
+    }
+
+    // Add format flags
     if args.json {
-        let json_value = evaluator.value_to_json(&value)?;
-        println!("{}", serde_json::to_string(&json_value)?);
-    } else if args.raw {
-        // Raw mode: print strings without quotes
-        let vtype = evaluator.value_type(&value)?;
-        match vtype {
-            ValueType::String => {
-                let s = evaluator.require_string(&value)?;
-                print!("{}", s);
-            }
-            _ => {
-                // For non-strings, use Nix format
-                let s = evaluator.value_to_nix_string(&value)?;
-                print!("{}", s);
-            }
-        }
-    } else {
-        // Default: Nix format
-        let s = evaluator.value_to_nix_string(&value)?;
-        println!("{}", s);
+        cmd.arg("--json");
+    }
+
+    if args.raw {
+        cmd.arg("--raw");
+    }
+
+    // Add --apply if specified
+    if let Some(ref apply_expr) = args.apply {
+        cmd.arg("--apply").arg(apply_expr);
+    }
+
+    // Always use --impure for compatibility
+    cmd.arg("--impure");
+
+    let status = cmd.status().context("failed to run nix eval")?;
+
+    if !status.success() {
+        anyhow::bail!("nix eval failed");
     }
 
     Ok(())
-}
-
-/// Build a Nix attrset expression from --arg and --argstr pairs.
-fn build_args_expr(arg: &[String], argstr: &[String]) -> Result<Option<String>> {
-    let mut bindings = Vec::new();
-
-    // Parse --arg pairs (name, expression)
-    for chunk in arg.chunks(2) {
-        if chunk.len() == 2 {
-            let name = &chunk[0];
-            let expr = &chunk[1];
-            if !is_valid_nix_identifier(name) {
-                return Err(anyhow!("invalid argument name: {}", name));
-            }
-            bindings.push(format!("{} = {};", name, expr));
-        }
-    }
-
-    // Parse --argstr pairs (name, string value)
-    for chunk in argstr.chunks(2) {
-        if chunk.len() == 2 {
-            let name = &chunk[0];
-            let value = &chunk[1];
-            if !is_valid_nix_identifier(name) {
-                return Err(anyhow!("invalid argument name: {}", name));
-            }
-            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-            bindings.push(format!("{} = \"{}\";", name, escaped));
-        }
-    }
-
-    if bindings.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(format!("{{ {} }}", bindings.join(" "))))
-    }
-}
-
-/// Check if a string is a valid Nix identifier.
-fn is_valid_nix_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let mut chars = s.chars();
-    // First char must be letter or underscore
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
-    }
-    // Rest can be alphanumeric, underscore, hyphen, or apostrophe
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '\'')
-}
-
-/// Evaluate an installable (flake reference with optional attribute path).
-fn eval_installable(
-    evaluator: &mut Evaluator,
-    installable: &str,
-    input_overrides: &HashMap<String, String>,
-) -> Result<crate::eval::NixValue> {
-    use tracing::debug;
-
-    let cwd = env::current_dir().context("failed to get current directory")?;
-    let system = current_system()?;
-
-    // Resolve the installable (handles local paths, registry names, and remote refs)
-    let resolved = resolve_installable_any(installable, &cwd);
-
-    if resolved.is_local {
-        let flake_path = resolved
-            .path
-            .as_ref()
-            .ok_or_else(|| anyhow!("local flake must have path"))?;
-
-        // Expand the attribute path with system and fallbacks
-        let candidates = expand_eval_attr_path(&resolved.attribute, &system);
-
-        // Try each candidate until one works
-        let mut last_err = None;
-        for candidate in &candidates {
-            let result = if input_overrides.is_empty() {
-                evaluator.eval_flake_attr(flake_path, candidate)
-            } else {
-                evaluator.eval_flake_attr_with_overrides(flake_path, candidate, input_overrides)
-            };
-            match result {
-                Ok(value) => return Ok(value),
-                Err(e) => {
-                    debug!("candidate {} failed: {}", candidate.join("."), e);
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| anyhow!("no candidates to try")))
-    } else {
-        // Remote flake - use native flake API
-        // Build the full flake ref with attribute path for system expansion
-        let flake_ref_base = resolved
-            .flake_ref
-            .as_deref()
-            .unwrap_or(installable.split('#').next().unwrap_or(installable));
-
-        // If there's an attribute path, try with system expansion
-        if !resolved.attribute.is_empty() {
-            let candidates = expand_eval_attr_path(&resolved.attribute, &system);
-
-            let mut last_err = None;
-            for candidate in &candidates {
-                let full_ref = format!("{}#{}", flake_ref_base, candidate.join("."));
-                debug!("trying remote flake ref: {}", full_ref);
-                match evaluator.eval_flake_ref(&full_ref, &cwd) {
-                    Ok(value) => return Ok(value),
-                    Err(e) => {
-                        debug!("candidate {} failed: {}", full_ref, e);
-                        last_err = Some(e);
-                    }
-                }
-            }
-
-            Err(last_err.unwrap_or_else(|| anyhow!("no candidates to try")))
-        } else {
-            // No attribute path - evaluate the whole flake
-            evaluator.eval_flake_ref(flake_ref_base, &cwd)
-        }
-    }
 }
 
 /// Expand an attribute path for eval, returning multiple candidates to try.
@@ -309,7 +292,7 @@ fn eval_installable(
 /// For paths that start with a known category (packages, devShells, etc.),
 /// inserts the system if needed.
 ///
-/// For paths that don't start with a known category (e.g., ["hello"] or ["rclone", "name"]),
+/// For paths that don't start with a known category (e.g., ["hello"] or ["lib", "testValue"]),
 /// tries packages.<system>.path, then legacyPackages.<system>.path, then the raw path.
 fn expand_eval_attr_path(attr_path: &[String], system: &str) -> Vec<Vec<String>> {
     // Empty path - return as-is
@@ -320,13 +303,27 @@ fn expand_eval_attr_path(attr_path: &[String], system: &str) -> Vec<Vec<String>>
     let first = &attr_path[0];
 
     // Check if first element is a known per-system category
-    let per_system_categories = ["packages", "devShells", "apps", "checks", "legacyPackages", "formatter"];
+    let per_system_categories = [
+        "packages",
+        "devShells",
+        "apps",
+        "checks",
+        "legacyPackages",
+        "formatter",
+    ];
     let is_per_system = per_system_categories.iter().any(|&c| c == first);
 
     // Check if first element is a known top-level category (no system needed)
     let top_level_categories = [
-        "overlays", "nixosModules", "nixosConfigurations", "darwinModules",
-        "darwinConfigurations", "homeModules", "homeConfigurations", "templates", "lib",
+        "overlays",
+        "nixosModules",
+        "nixosConfigurations",
+        "darwinModules",
+        "darwinConfigurations",
+        "homeModules",
+        "homeConfigurations",
+        "templates",
+        "lib",
     ];
     let is_top_level = top_level_categories.iter().any(|&c| c == first);
 
@@ -338,7 +335,15 @@ fn expand_eval_attr_path(attr_path: &[String], system: &str) -> Vec<Vec<String>>
     if is_per_system {
         // Per-system category: insert system after category if not already present
         let looks_like_system = |s: &str| -> bool {
-            matches!(s, "x86_64-linux" | "aarch64-linux" | "x86_64-darwin" | "aarch64-darwin" | "i686-linux" | "armv7l-linux")
+            matches!(
+                s,
+                "x86_64-linux"
+                    | "aarch64-linux"
+                    | "x86_64-darwin"
+                    | "aarch64-darwin"
+                    | "i686-linux"
+                    | "armv7l-linux"
+            )
         };
 
         if attr_path.len() >= 2 && looks_like_system(&attr_path[1]) {
@@ -365,7 +370,7 @@ fn expand_eval_attr_path(attr_path: &[String], system: &str) -> Vec<Vec<String>>
     legacy_path.extend(attr_path.iter().cloned());
     candidates.push(legacy_path);
 
-    // Try raw path as fallback
+    // Try raw path as fallback (important for things like lib.testValue)
     candidates.push(attr_path.to_vec());
 
     candidates

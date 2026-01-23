@@ -8,7 +8,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument, trace};
 
-use crate::eval::Evaluator;
+use crate::eval;
+use crate::lock;
 use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
 use crate::progress;
 
@@ -117,24 +118,18 @@ fn run_file_mode(args: &BuildArgs, file_path: &PathBuf) -> Result<()> {
 
     trace!("generated expression:\n{}", derivation_expr);
 
-    // Initialize the evaluator
-    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-
-    // Evaluate the expression
+    // Evaluate the expression to .drv
     let status = progress::evaluating(&display_path);
-    let value = eval
-        .eval_string(&derivation_expr, &display_path)
+    let drv_path_str = eval::eval_to_drv(&derivation_expr, &display_path)
         .context("evaluation failed")?;
     status.finish_and_clear();
 
-    // Get the .drv path for logging
-    let drv_path_str = eval.get_drv_path(&value)?;
     debug!(drv = %drv_path_str, "got derivation path");
 
-    // Build the derivation using native build
+    // Build the derivation using subprocess
     info!("building {}", drv_path_str);
     let status = progress::building(&drv_path_str);
-    let output_path = eval.build_value(&value).context("build failed")?;
+    let output_path = eval::build_drv(&drv_path_str).context("build failed")?;
     status.finish_and_clear();
 
     debug!(output = %output_path, "build completed");
@@ -247,8 +242,8 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
     debug!(?candidates, %system, "expanded attribute candidates");
 
-    // Step 4: Initialize the evaluator and try each candidate
-    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
+    // Step 4: Read flake.lock (missing lock is OK for flakes with no inputs)
+    let lock = lock::read_flake_lock(flake_path).unwrap_or_else(|_| lock::FlakeLock::empty());
 
     // Build flake URL for error messages
     let canonical = flake_path
@@ -267,23 +262,25 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
         debug!(?input_overrides, "using input overrides");
     }
 
-    let (attr_path, value) = {
+    // Step 5: Try each candidate attribute using new evaluator
+    let (attr_path, drv_path_str) = {
         let mut found = None;
 
         for candidate in &candidates {
             let eval_target = format!("{}#{}", flake_path.display(), candidate.join("."));
             trace!("trying {}", eval_target);
 
-            let result = if input_overrides.is_empty() {
-                eval.eval_flake_attr(flake_path, candidate)
-            } else {
-                eval.eval_flake_attr_with_overrides(flake_path, candidate, &input_overrides)
-            };
+            let result = eval::generate_and_eval_local_flake(
+                flake_path,
+                &lock,
+                candidate,
+                &input_overrides,
+            );
 
             match result {
-                Ok(value) => {
+                Ok(drv_path) => {
                     info!("evaluating {}", eval_target);
-                    found = Some((candidate.clone(), value));
+                    found = Some((candidate.clone(), drv_path));
                     break;
                 }
                 Err(e) => {
@@ -297,16 +294,12 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
         })?
     };
 
-    debug!(attr = %attr_path.join("."), "found attribute");
+    debug!(attr = %attr_path.join("."), drv = %drv_path_str, "found attribute");
 
-    // Get the .drv path for logging
-    let drv_path_str = eval.get_drv_path(&value)?;
-    debug!(drv = %drv_path_str, "got derivation path");
-
-    // Step 5: Build the derivation using native build
+    // Step 6: Build the derivation using subprocess
     info!("building {}", drv_path_str);
     let status = progress::building(&drv_path_str);
-    let output_path = eval.build_value(&value).context("build failed")?;
+    let output_path = eval::build_drv(&drv_path_str).context("build failed")?;
     status.finish_and_clear();
 
     debug!(output = %output_path, "build completed");

@@ -284,7 +284,6 @@ const NIX_INDEX_REV: &str = "0fc38040a22a08052103d0fbbafd67ac54165f2b";
 #[test]
 fn nix_index_show() {
     // This flake uses `cargoLock.lockFile = ./Cargo.lock` which requires path coercion.
-    // Path coercion now works correctly with our fix to nix-bindings-rust.
     let flake = fetch_github_flake("nix-community", "nix-index", NIX_INDEX_REV)
         .expect("failed to fetch nix-index");
     compare_flake_show(flake.path(), false);

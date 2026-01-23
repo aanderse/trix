@@ -14,8 +14,9 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
+use crate::lock::{self, FlakeLock};
 use crate::progress;
 
 /// Manifest file structure (version 3)
@@ -390,30 +391,30 @@ pub fn parse_installable_for_profile(installable: &str) -> (String, String, Stri
 }
 
 /// Build a package and return its store path.
-/// Uses native evaluation.
-/// Try to evaluate and build a package candidate.
-/// Returns (attr_path, store_path) on success.
+/// Try to evaluate and build a package candidate using subprocess.
+/// Returns store_path on success.
 fn try_build_candidate(
-    eval: &mut Evaluator,
     flake_dir: &Path,
+    lock: &FlakeLock,
     attr_path: &[String],
     input_overrides: &HashMap<String, String>,
 ) -> Result<String> {
-    let value = if input_overrides.is_empty() {
-        eval.eval_flake_attr(flake_dir, attr_path)
-    } else {
-        eval.eval_flake_attr_with_overrides(flake_dir, attr_path, input_overrides)
-    }
+    // Evaluate to get drv path
+    let drv_path = eval::generate_and_eval_local_flake(
+        flake_dir,
+        lock,
+        attr_path,
+        input_overrides,
+    )
     .context("failed to evaluate derivation")?;
 
-    let drv_path = eval.get_drv_path(&value)?;
     debug!(drv = %drv_path, "got derivation path");
 
     // Build it
     info!("building {}", drv_path);
     let build_status = progress::building(&drv_path);
 
-    let store_path = eval.build_value(&value)?;
+    let store_path = eval::build_drv(&drv_path).context("build failed")?;
 
     build_status.finish_and_clear();
 
@@ -435,7 +436,7 @@ pub fn install(
     let resolved = resolve_installable_any(installable, &cwd);
 
     let (store_path, attr_path_str, flake_url) = if resolved.is_local {
-        // Local flake - use our evaluator
+        // Local flake - use our subprocess evaluator
         let flake_path = resolved.path.as_ref().expect("local flake must have path");
         let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
 
@@ -451,8 +452,8 @@ pub fn install(
             format!("path:{}", canonical.display())
         };
 
-        // Initialize evaluator once and reuse for all candidates
-        let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
+        // Read flake.lock
+        let lock = lock::read_flake_lock(flake_path)?;
 
         // Try each candidate until one works (like build.rs does)
         let (attr_path, store_path) = {
@@ -463,7 +464,7 @@ pub fn install(
                 info!("evaluating {}", eval_target);
                 let status = progress::evaluating(&eval_target);
 
-                match try_build_candidate(&mut eval, flake_path, candidate, input_overrides) {
+                match try_build_candidate(flake_path, &lock, candidate, input_overrides) {
                     Ok(path) => {
                         status.finish_and_clear();
                         found = Some((candidate.clone(), path));
@@ -700,6 +701,16 @@ pub fn upgrade(
                     continue;
                 }
 
+                // Read flake.lock
+                let lock = match lock::read_flake_lock(&flake_dir) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("warning: failed to read flake.lock for {}: {}", pkg_name, e);
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
                 // Build the attribute path - try each candidate
                 let candidates = expand_attribute(
                     &attr.split('.').map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -707,20 +718,10 @@ pub fn upgrade(
                     &system,
                 );
 
-                // Initialize evaluator once for this package
-                let mut eval = match Evaluator::new() {
-                    Ok(e) => e,
-                    Err(e) => {
-                        eprintln!("warning: failed to initialize evaluator for {}: {}", pkg_name, e);
-                        skipped += 1;
-                        continue;
-                    }
-                };
-
                 // Try each candidate until one works
                 let mut build_result = None;
                 for candidate in &candidates {
-                    match try_build_candidate(&mut eval, &flake_dir, candidate, input_overrides) {
+                    match try_build_candidate(&flake_dir, &lock, candidate, input_overrides) {
                         Ok(path) => {
                             build_result = Some(Ok(path));
                             break;

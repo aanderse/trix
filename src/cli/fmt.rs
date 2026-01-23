@@ -7,8 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument};
 
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, resolve_installable_any};
+use crate::lock;
 use crate::progress;
 
 #[derive(Args)]
@@ -38,7 +39,10 @@ pub fn run(args: FmtArgs) -> Result<()> {
     let flake_path = resolved.path.expect("local flake should have path");
     debug!(flake_path = %flake_path.display(), "resolved flake");
 
-    // Step 2: Get the formatter for the current system using native evaluation
+    // Step 2: Read flake.lock
+    let lock = lock::read_flake_lock(&flake_path)?;
+
+    // Step 3: Get the formatter for the current system
     let system = current_system()?;
     let attr_path = vec!["formatter".to_string(), system.clone()];
 
@@ -47,26 +51,33 @@ pub fn run(args: FmtArgs) -> Result<()> {
 
     let status = progress::evaluating(&eval_target);
 
-    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-    let value = eval
-        .eval_flake_attr(&flake_path, &attr_path)
-        .context("failed to evaluate formatter - does the flake have a formatter output?")?;
+    let drv_path = eval::generate_and_eval_local_flake(
+        &flake_path,
+        &lock,
+        &attr_path,
+        &std::collections::HashMap::new(),
+    )
+    .context("failed to evaluate formatter - does the flake have a formatter output?")?;
 
     status.finish_and_clear();
-
-    let drv_path = eval.get_drv_path(&value)?;
     debug!(drv = %drv_path, "got derivation path");
 
     // Step 4: Build the formatter
     info!("building {}", drv_path);
     let build_status = progress::building(&drv_path);
 
-    let store_path = eval.build_value(&value)?;
+    let store_path = eval::build_drv(&drv_path)?;
 
     build_status.finish_and_clear();
 
     // Step 5: Get the main program name
-    let main_program = eval.get_main_program(&value, "formatter")?;
+    let main_program = eval::get_main_program(
+        &flake_path,
+        &lock,
+        &attr_path,
+        &std::collections::HashMap::new(),
+        "formatter",
+    )?;
     let exe_path = format!("{}/bin/{}", store_path, main_program);
 
     debug!("formatter executable: {}", exe_path);

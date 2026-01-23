@@ -11,8 +11,9 @@ use clap::Args;
 use owo_colors::{OwoColorize, Stream::Stdout};
 use tracing::{debug, info, trace};
 
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable, OperationContext};
+use crate::lock;
 use crate::profile::{get_profile_dir_for, parse_generation_number, parse_store_path, Manifest};
 
 #[derive(Args)]
@@ -538,19 +539,25 @@ fn resolve_to_drv(arg: &str) -> Result<String> {
         let is_local = resolved.path.exists() && resolved.path.join("flake.nix").exists();
 
         if is_local {
+            // Read flake.lock
+            let lock = lock::read_flake_lock(&resolved.path)?;
+
             let system = current_system()?;
             let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
             debug!(?candidates, "expanded attribute candidates");
 
-            let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-
             // Try each candidate until one succeeds
             for candidate in &candidates {
                 trace!("trying candidate: {}", candidate.join("."));
-                match eval.eval_flake_attr(&resolved.path, candidate) {
-                    Ok(value) => {
+                match eval::generate_and_eval_local_flake(
+                    &resolved.path,
+                    &lock,
+                    candidate,
+                    &HashMap::new(),
+                ) {
+                    Ok(drv_path) => {
                         debug!(attr = %candidate.join("."), "found attribute");
-                        return eval.get_drv_path(&value);
+                        return Ok(drv_path);
                     }
                     Err(e) => {
                         trace!("candidate {} failed: {}", candidate.join("."), e);

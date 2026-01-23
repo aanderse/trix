@@ -6,7 +6,6 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::eval::Evaluator;
 use crate::flake::resolve_installable;
 
 #[derive(Args)]
@@ -182,9 +181,8 @@ pub fn run(args: LockArgs) -> Result<()> {
 /// Extract inputs from flake.nix without using builtins.getFlake
 #[instrument(level = "debug", skip_all, fields(flake_path = %flake_path))]
 fn extract_flake_inputs(flake_path: &str) -> Result<Vec<FlakeInput>> {
-    // Use nix-bindings evaluator to extract just the inputs
-    trace!("initializing evaluator for input extraction");
-    let mut evaluator = Evaluator::new().context("failed to initialize Nix evaluator")?;
+    // Use nix eval to extract inputs as JSON
+    trace!("using nix eval to extract inputs");
 
     // This expression imports flake.nix directly and extracts inputs
     // It does NOT use builtins.getFlake, so it won't copy to the store
@@ -227,50 +225,55 @@ fn extract_flake_inputs(flake_path: &str) -> Result<Vec<FlakeInput>> {
         flake_path
     );
 
-    let value = evaluator.eval_string(&expr, "<trix inputs>")?;
+    let output = Command::new("nix")
+        .args(["--extra-experimental-features", "nix-command", "eval", "--json", "--impure", "--expr", &expr])
+        .output()
+        .context("failed to run nix eval")?;
 
-    // Parse the result - it's a list of attrsets
-    let list_size = evaluator.require_list_size(&value)?;
-    trace!(count = list_size, "found raw inputs");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("failed to evaluate inputs: {}", stderr.trim()));
+    }
+
+    // Parse JSON output
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("failed to parse nix eval JSON output")?;
+
+    let input_list = json.as_array()
+        .ok_or_else(|| anyhow!("expected JSON array from nix eval"))?;
+
+    trace!(count = input_list.len(), "found raw inputs");
 
     let mut inputs = Vec::new();
-    for i in 0..list_size {
-        let item = evaluator.require_list_elem(&value, i)?;
+    for item in input_list {
+        let name = item.get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
 
-        let name = evaluator.get_attr(&item, "name")?
-            .and_then(|v| evaluator.require_string(&v).ok())
-            .unwrap_or_default();
+        let url = item.get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(String::from);
 
-        let url = evaluator.get_attr(&item, "url")?
-            .and_then(|v| evaluator.require_string(&v).ok())
-            .filter(|s| s != "null" && !s.is_empty());
+        let follows = item.get("follows")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(String::from);
 
-        let follows = evaluator.get_attr(&item, "follows")?
-            .and_then(|v| evaluator.require_string(&v).ok())
-            .filter(|s| s != "null" && !s.is_empty());
-
-        let flake = evaluator.get_attr(&item, "flake")?
-            .and_then(|v| evaluator.require_bool(&v).ok())
+        let flake = item.get("flake")
+            .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        // Extract nested follows (list of {inputName, followsPath} pairs)
+        // Extract nested follows
         let mut nested_follows = std::collections::HashMap::new();
-        if let Ok(Some(nf_list)) = evaluator.get_attr(&item, "nestedFollows") {
-            if let Ok(list_size) = evaluator.require_list_size(&nf_list) {
-                for j in 0..list_size {
-                    if let Ok(nf_item) = evaluator.require_list_elem(&nf_list, j) {
-                        let input_name = evaluator.get_attr(&nf_item, "inputName")
-                            .ok()
-                            .flatten()
-                            .and_then(|v| evaluator.require_string(&v).ok());
-                        let follows_path = evaluator.get_attr(&nf_item, "followsPath")
-                            .ok()
-                            .flatten()
-                            .and_then(|v| evaluator.require_string(&v).ok());
-                        if let (Some(inp), Some(fol)) = (input_name, follows_path) {
-                            nested_follows.insert(inp, fol);
-                        }
-                    }
+        if let Some(nf_list) = item.get("nestedFollows").and_then(|v| v.as_array()) {
+            for nf_item in nf_list {
+                if let (Some(input_name), Some(follows_path)) = (
+                    nf_item.get("inputName").and_then(|v| v.as_str()),
+                    nf_item.get("followsPath").and_then(|v| v.as_str()),
+                ) {
+                    nested_follows.insert(input_name.to_string(), follows_path.to_string());
                 }
             }
         }
@@ -288,7 +291,7 @@ fn extract_flake_inputs(flake_path: &str) -> Result<Vec<FlakeInput>> {
 fn prefetch_input(url: &str) -> Result<serde_json::Value> {
     debug!("+ nix flake prefetch --json {}", url);
     let output = Command::new("nix")
-        .args(["flake", "prefetch", "--json", url])
+        .args(["--extra-experimental-features", "nix-command flakes", "flake", "prefetch", "--json", url])
         .output()
         .context("failed to run nix flake prefetch")?;
 
@@ -309,7 +312,7 @@ fn prefetch_input(url: &str) -> Result<serde_json::Value> {
 fn get_flake_metadata(url: &str) -> Result<serde_json::Value> {
     trace!("+ nix flake metadata --json {}", url);
     let output = Command::new("nix")
-        .args(["flake", "metadata", "--json", url])
+        .args(["--extra-experimental-features", "nix-command flakes", "flake", "metadata", "--json", url])
         .output()
         .context("failed to run nix flake metadata")?;
 

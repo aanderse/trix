@@ -7,8 +7,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument, trace};
 
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
+use crate::lock;
 use crate::progress;
 
 #[derive(Args)]
@@ -42,25 +43,33 @@ pub fn run(args: CopyArgs) -> Result<()> {
     let flake_path = resolved.path.expect("local flake should have path");
     debug!(flake_path = %flake_path.display(), "resolved flake");
 
-    // Step 2: Evaluate to get the store path using native evaluation
+    // Step 2: Read flake.lock
+    let lock = lock::read_flake_lock(&flake_path)?;
+
+    // Step 3: Evaluate to get the derivation path
     let system = current_system()?;
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
     debug!(?candidates, "expanded attribute candidates");
 
-    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
-
     // Try each candidate until one succeeds
-    let (attr_path, value) = {
+    let (attr_path, drv_path) = {
         let mut found = None;
 
         for candidate in &candidates {
             let eval_target = format!("{}#{}", flake_path.display(), candidate.join("."));
             trace!("trying {}", eval_target);
 
-            match eval.eval_flake_attr(&flake_path, candidate) {
-                Ok(value) => {
+            let result = eval::generate_and_eval_local_flake(
+                &flake_path,
+                &lock,
+                candidate,
+                &std::collections::HashMap::new(),
+            );
+
+            match result {
+                Ok(drv_path) => {
                     info!("evaluating {}", eval_target);
-                    found = Some((candidate.clone(), value));
+                    found = Some((candidate.clone(), drv_path));
                     break;
                 }
                 Err(e) => {
@@ -80,22 +89,19 @@ pub fn run(args: CopyArgs) -> Result<()> {
         })?
     };
 
-    debug!(attr = %attr_path.join("."), "found attribute");
+    debug!(attr = %attr_path.join("."), drv = %drv_path, "found attribute");
 
-    let drv_path = eval.get_drv_path(&value)?;
-    debug!(drv = %drv_path, "got derivation path");
-
-    // Step 3: Build to get the store path
+    // Step 4: Build to get the store path
     info!("building {}", drv_path);
     let build_status = progress::building(&drv_path);
 
-    let store_path = eval.build_value(&value)?;
+    let store_path = eval::build_drv(&drv_path).context("build failed")?;
 
     build_status.finish_and_clear();
 
     debug!(store_path = %store_path, "built store path");
 
-    // Step 4: Copy to destination
+    // Step 5: Copy to destination
     info!("copying {} to {}", store_path, args.to);
     let copy_status = progress::copying(&store_path);
 

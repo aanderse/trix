@@ -13,9 +13,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, info, instrument};
 
-use crate::eval::generate_flake_eval_expr;
+use crate::eval::{self, generate_flake_eval_expr};
 use crate::flake::resolve_installable_any;
-use crate::lock::FlakeLock;
+use crate::lock;
 
 #[derive(Args)]
 pub struct ReplArgs {
@@ -50,27 +50,16 @@ pub fn run(args: ReplArgs) -> Result<()> {
                 .ok_or_else(|| anyhow!("invalid flake path"))?;
 
             // Load and parse the lock file
-            let lock_path = flake_path.join("flake.lock");
-            let lock = if lock_path.exists() {
-                debug!("reading flake.lock");
-                let content =
-                    std::fs::read_to_string(&lock_path).context("failed to read flake.lock")?;
-                let lock: FlakeLock =
-                    serde_json::from_str(&content).context("failed to parse flake.lock")?;
-                debug!(nodes = lock.nodes.len(), "parsed flake.lock");
-                lock
-            } else {
-                debug!("no flake.lock found, using empty lock");
-                FlakeLock {
-                    nodes: HashMap::new(),
-                    root: "root".to_string(),
-                    version: 7,
-                }
-            };
+            let lock = lock::read_flake_lock(flake_path)
+                .unwrap_or_else(|_| lock::FlakeLock::empty());
+            debug!(nodes = lock.nodes.len(), "parsed flake.lock");
+
+            // Prefetch all inputs to the store
+            let store_paths = eval::prefetch_all_inputs(&lock)?;
 
             // Generate the evaluation expression for the whole flake outputs
             // We pass an empty attr_path to get the full outputs attrset
-            let expr = generate_flake_eval_expr(path_str, &lock, &[], &HashMap::new())?;
+            let expr = generate_flake_eval_expr(path_str, &lock, &[], &HashMap::new(), &store_paths)?;
 
             info!("starting repl for {}", flake_path.display());
             debug!("using --expr to evaluate flake in-place (no store copy)");

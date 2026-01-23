@@ -8,8 +8,9 @@ use clap::Args;
 use tracing::{debug, info, instrument};
 
 use crate::cli::build::parse_override_inputs;
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, expand_attribute, resolve_installable_any, OperationContext};
+use crate::lock;
 use crate::progress;
 
 #[derive(Args)]
@@ -221,9 +222,11 @@ fn run_flake_mode(args: &DevelopArgs) -> Result<()> {
         debug!(?input_overrides, "using input overrides");
     }
 
-    // Step 3: Evaluate the devShell to get drvPath using native evaluation
+    // Step 3: Read flake.lock
+    let lock = lock::read_flake_lock(&flake_path)?;
+
+    // Step 4: Evaluate the devShell to get drvPath
     // Try each candidate in order until one succeeds (fallback order: devShells, devShell, packages)
-    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
     let mut last_error = None;
     let mut drv_path_str = None;
     let mut successful_attr = None;
@@ -233,30 +236,23 @@ fn run_flake_mode(args: &DevelopArgs) -> Result<()> {
         debug!(attr = %attr_path.join("."), "trying candidate");
 
         let status = progress::evaluating(&eval_target);
-        let result = if input_overrides.is_empty() {
-            eval.eval_flake_attr(&flake_path, attr_path)
-        } else {
-            eval.eval_flake_attr_with_overrides(&flake_path, attr_path, &input_overrides)
-        };
+        let result = eval::generate_and_eval_local_flake(
+            &flake_path,
+            &lock,
+            attr_path,
+            &input_overrides,
+        );
+
         match result {
-            Ok(value) => {
-                match eval.get_drv_path(&value) {
-                    Ok(path) => {
-                        status.finish_and_clear();
-                        drv_path_str = Some(path);
-                        successful_attr = Some(attr_path.join("."));
-                        break;
-                    }
-                    Err(e) => {
-                        status.finish_and_clear();
-                        debug!(attr = %attr_path.join("."), error = %e, "candidate not a derivation");
-                        last_error = Some(e);
-                    }
-                }
+            Ok(path) => {
+                status.finish_and_clear();
+                drv_path_str = Some(path);
+                successful_attr = Some(attr_path.join("."));
+                break;
             }
             Err(e) => {
                 status.finish_and_clear();
-                debug!(attr = %attr_path.join("."), error = %e, "candidate not found");
+                debug!(attr = %attr_path.join("."), error = %e, "candidate failed");
                 last_error = Some(e);
             }
         }

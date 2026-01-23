@@ -89,7 +89,7 @@ fn resolve_to_store_path(ref_str: &str, cwd: &std::path::Path) -> Result<String>
         for candidate in &candidates {
             trace!("trying candidate: {}", candidate.join("."));
 
-            let expr = match generate_flake_eval_expr(flake_dir, lock, candidate, &HashMap::new()) {
+            let expr = match generate_flake_eval_expr(flake_dir, lock, candidate, &HashMap::new(), &HashMap::new()) {
                 Ok(e) => e,
                 Err(e) => {
                     trace!("candidate {} failed to generate expr: {}", candidate.join("."), e);
@@ -97,10 +97,11 @@ fn resolve_to_store_path(ref_str: &str, cwd: &std::path::Path) -> Result<String>
                 }
             };
 
-            let output = Command::new("nix-instantiate")
-                .args(["-E", &expr])
+            let drv_expr = format!("({}).drvPath", expr);
+            let output = Command::new("nix")
+                .args(["eval", "--raw", "--impure", "--expr", &drv_expr])
                 .output()
-                .context("failed to run nix-instantiate")?;
+                .context("failed to run nix eval")?;
 
             if output.status.success() {
                 let drv = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -125,10 +126,11 @@ fn resolve_to_store_path(ref_str: &str, cwd: &std::path::Path) -> Result<String>
     };
 
     // Build the derivation
-    let output = Command::new("nix-store")
-        .args(["--realise", &drv_path, "--no-gc-warning"])
+    let installable = format!("{}^*", drv_path);
+    let output = Command::new("nix")
+        .args(["build", &installable, "--no-link", "--print-out-paths"])
         .output()
-        .context("failed to run nix-store --realise")?;
+        .context("failed to run nix build")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -137,7 +139,7 @@ fn resolve_to_store_path(ref_str: &str, cwd: &std::path::Path) -> Result<String>
 
     let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-    // nix-store --realise can return multiple paths, we want the first one
+    // nix build can return multiple paths, we want the first one
     let store_path = store_path.lines().next().unwrap_or(&store_path).to_string();
 
     Ok(store_path)

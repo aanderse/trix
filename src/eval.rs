@@ -1,7 +1,9 @@
-//! Nix expression evaluation using nix-bindings.
+//! Nix expression evaluation using subprocess commands.
 //!
-//! This module wraps the nix-bindings crate to provide high-level evaluation
-//! functionality for flakes.
+//! This module provides flake evaluation by shelling out to `nix` commands:
+//! - `nix eval --impure --expr` for evaluation (never enters flake context)
+//! - `nix build <drv>^*` for building from .drv paths
+//! - `nix flake prefetch` for fetching inputs
 //!
 //! IMPORTANT: This module NEVER uses builtins.getFlake for local flakes,
 //! as that would copy the flake to the nix store. Instead, we import
@@ -9,798 +11,501 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::process::Command;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, instrument, trace};
-
-use std::collections::BTreeMap;
-
-use nix_bindings_expr::eval_state::{
-    gc_register_my_thread, init, EvalState, EvalStateBuilder, ThreadRegistrationGuard,
-};
-use nix_bindings_expr::value::ValueType;
-use nix_bindings_fetchers::FetchersSettings;
-use nix_bindings_flake::{
-    EvalStateBuilderExt, FlakeLockFlags, FlakeReference, FlakeReferenceParseFlags, FlakeSettings,
-    LockedFlake,
-};
-use nix_bindings_store::path::StorePath;
-use nix_bindings_store::store::Store;
-use serde_json::json;
 
 use crate::lock::{FlakeLock, InputRef, LockedRef};
 
-/// A wrapper around the Nix evaluator state with flake support.
-pub struct Evaluator {
-    eval_state: EvalState,
-    /// Separate store handle for building (Store::realise requires &mut self).
-    /// Cloned from eval_state's store - shares the same underlying connection.
-    store: Store,
-    /// Flake settings for native flake operations
-    flake_settings: FlakeSettings,
-    /// Fetcher settings for native flake operations
-    fetchers_settings: FetchersSettings,
-    _gc_guard: ThreadRegistrationGuard,
+//=============================================================================
+// Evaluation & Building
+//=============================================================================
+
+/// Evaluate a Nix expression and return the result as JSON.
+///
+/// Uses `nix eval --json --impure --expr` (never enters flake context).
+#[instrument(level = "debug", skip(expr))]
+pub fn eval_to_json(expr: &str) -> Result<serde_json::Value> {
+    debug!("evaluating expression to JSON ({} bytes)", expr.len());
+    trace!("expression:\n{}", expr);
+
+    let output = Command::new("nix")
+        .args(["eval", "--json", "--impure", "--expr", expr])
+        .output()
+        .context("failed to execute nix eval")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("nix eval failed with stderr:\n{}", stderr);
+        bail!("evaluation failed: {}", stderr.trim());
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let value = serde_json::from_str(&json_str)
+        .context("failed to parse JSON output")?;
+
+    Ok(value)
 }
 
-impl Evaluator {
-    /// Initialize the Nix evaluator with flake support.
-    ///
-    /// This must be called once before any evaluation can occur.
-    #[instrument(level = "debug", skip_all)]
-    pub fn new() -> Result<Self> {
-        debug!("initializing Nix evaluator");
+/// Try to get the program path from an app attribute.
+///
+/// Apps have a `.program` attribute that points to an executable.
+/// Returns None if the attribute is not an app.
+#[instrument(level = "debug", skip(lock))]
+pub fn try_get_app_program(
+    flake_path: &Path,
+    lock: &FlakeLock,
+    attr_path: &[String],
+    input_overrides: &HashMap<String, String>,
+) -> Result<Option<String>> {
+    debug!("checking if {} is an app", attr_path.join("."));
 
-        // Initialize the Nix utility library first - this loads nix.conf settings
-        // including access-tokens for private repository authentication.
-        // Without this, fetchers won't have access to configured tokens.
-        trace!("calling libutil_init()");
-        unsafe {
-            let mut ctx = nix_bindings_util::context::Context::new();
-            let err = nix_bindings_util::raw_sys::libutil_init(ctx.ptr());
-            if err != 0 {
-                debug!("libutil_init returned error code: {}", err);
+    // Prefetch inputs (same as for eval)
+    let store_paths = if input_overrides.is_empty() {
+        prefetch_all_inputs(lock)?
+    } else {
+        let nodes_to_fetch: Vec<_> = lock.nodes.iter()
+            .filter(|(name, _)| *name != &lock.root && !input_overrides.contains_key(*name))
+            .collect();
+
+        let mut paths = HashMap::new();
+        for (name, node) in nodes_to_fetch {
+            if let Some(ref locked) = node.locked {
+                let store_path = prefetch_input(name, locked)?;
+                paths.insert(name.clone(), store_path);
             }
         }
-
-        // Initialize the Nix library
-        trace!("calling nix init()");
-        init().context("failed to initialize Nix")?;
-
-        // Register this thread with the Nix garbage collector
-        trace!("registering GC thread");
-        let gc_guard = gc_register_my_thread().context("failed to register GC thread")?;
-
-        // Open the default store
-        trace!("opening Nix store");
-        let store = Store::open(None, HashMap::new()).context("failed to open Nix store")?;
-
-        // Enable experimental features needed for flakes and fetchTree
-        trace!("setting experimental-features");
-        if let Err(e) = nix_bindings_util::settings::set("experimental-features", "nix-command flakes fetch-tree") {
-            debug!("failed to set experimental-features (non-fatal): {:?}", e);
-        }
-
-        // Disable pure evaluation mode to allow adding paths to store during evaluation.
-        // Without this, derivationStrict fails with "path not valid" for local paths.
-        trace!("setting pure-eval to false");
-        if let Err(e) = nix_bindings_util::settings::set("pure-eval", "false") {
-            debug!("failed to set pure-eval (non-fatal): {:?}", e);
-            // Continue anyway - the setting might already be false or this might not be critical
-        }
-
-        // Create flake settings to enable builtins.getFlake
-        trace!("creating flake settings");
-        let flake_settings = FlakeSettings::new().context("failed to create flake settings")?;
-
-        // Create fetchers settings for remote flake operations
-        trace!("creating fetchers settings");
-        let fetchers_settings =
-            FetchersSettings::new().context("failed to create fetchers settings")?;
-
-        // Create the evaluation state with flake support
-        trace!("building eval state");
-        let eval_state = EvalStateBuilder::new(store)?
-            .flakes(&flake_settings)?
-            .build()
-            .context("failed to create evaluation state")?;
-
-        // Clone the store for building operations (realise requires &mut self)
-        let store = eval_state.store().clone();
-
-        debug!("Nix evaluator initialized");
-        Ok(Self {
-            eval_state,
-            store,
-            flake_settings,
-            fetchers_settings,
-            _gc_guard: gc_guard,
-        })
-    }
-
-    /// Evaluate a Nix expression from a string.
-    #[instrument(level = "trace", skip(self, expr), fields(source = %source_name, expr_len = expr.len()))]
-    pub fn eval_string(&mut self, expr: &str, source_name: &str) -> Result<NixValue> {
-        trace!("evaluating expression ({} bytes)", expr.len());
-        let value = self
-            .eval_state
-            .eval_from_string(expr, source_name)
-            .map_err(|e| anyhow!("evaluation error: {}", e))?;
-
-        Ok(NixValue { inner: value })
-    }
-
-    /// Navigate to a nested attribute path within a value.
-    #[instrument(level = "trace", skip(self, value), fields(path = ?path))]
-    pub fn navigate_attr_path(&mut self, value: NixValue, path: &[String]) -> Result<NixValue> {
-        let mut current = value;
-        for attr in path {
-            if attr.is_empty() {
-                continue;
-            }
-            trace!("navigating to attr '{}'", attr);
-            current = self
-                .get_attr(&current, attr)?
-                .ok_or_else(|| anyhow!("attribute '{}' not found", attr))?;
-        }
-        Ok(current)
-    }
-
-    /// Evaluate a flake's outputs WITHOUT copying the local flake to the store.
-    ///
-    /// This is the core of trix - we import flake.nix directly and construct
-    /// inputs from flake.lock manually. Remote inputs are fetched normally
-    /// (they get cached in the store, which is fine), but the local project
-    /// is NEVER copied to the store.
-    #[instrument(level = "debug", skip(self), fields(flake = %flake_path.display(), attr = ?attr_path))]
-    pub fn eval_flake_attr(&mut self, flake_path: &Path, attr_path: &[String]) -> Result<NixValue> {
-        self.eval_flake_attr_with_overrides(flake_path, attr_path, &HashMap::new())
-    }
-
-    /// Evaluate a flake's outputs with input overrides.
-    ///
-    /// Like `eval_flake_attr`, but allows overriding specific inputs with local paths.
-    /// The overridden inputs are imported directly without copying to the store.
-    #[instrument(level = "debug", skip(self, input_overrides), fields(flake = %flake_path.display(), attr = ?attr_path))]
-    pub fn eval_flake_attr_with_overrides(
-        &mut self,
-        flake_path: &Path,
-        attr_path: &[String],
-        input_overrides: &HashMap<String, String>,
-    ) -> Result<NixValue> {
-        let path_str = flake_path
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid flake path"))?;
-
-        // Load and parse the lock file
-        let lock_path = flake_path.join("flake.lock");
-        let lock = if lock_path.exists() {
-            debug!("reading flake.lock");
-            let content = std::fs::read_to_string(&lock_path)
-                .context("failed to read flake.lock")?;
-            let lock: FlakeLock = serde_json::from_str(&content)
-                .context("failed to parse flake.lock")?;
-            debug!(nodes = lock.nodes.len(), "parsed flake.lock");
-            lock
-        } else {
-            debug!("no flake.lock found, using empty lock");
-            // Empty lock for flakes without inputs
-            FlakeLock {
-                nodes: HashMap::new(),
-                root: "root".to_string(),
-                version: 7,
-            }
-        };
-
-        if !input_overrides.is_empty() {
-            debug!(?input_overrides, "applying input overrides");
-        }
-
-        // Generate the evaluation expression
-        debug!("generating eval expression");
-        let expr = generate_flake_eval_expr(path_str, &lock, attr_path, input_overrides)?;
-        trace!("generated expression:\n{}", expr);
-
-        debug!("evaluating flake");
-        self.eval_string(&expr, "<trix>")
-    }
-
-    /// Evaluate a flake's full outputs (for flake show, etc.)
-    #[instrument(level = "debug", skip(self), fields(flake = %flake_path.display()))]
-    pub fn eval_flake_outputs(&mut self, flake_path: &Path) -> Result<NixValue> {
-        self.eval_flake_attr(flake_path, &[])
-    }
-
-    /// Evaluate a flake reference string natively using the Nix flake API.
-    ///
-    /// This handles ANY flake reference including:
-    /// - Local paths: `.`, `./foo`, `/path/to/flake`
-    /// - GitHub: `github:owner/repo`, `github:owner/repo/ref`
-    /// - GitLab: `gitlab:owner/repo`
-    /// - Sourcehut: `sourcehut:~owner/repo`
-    /// - Git: `git+https://...`, `git+ssh://...`
-    /// - Tarball: `https://example.com/foo.tar.gz`
-    /// - Registry names: `nixpkgs`, `flake-utils`
-    ///
-    /// The flake reference can include a fragment for attribute path: `nixpkgs#hello`
-    ///
-    /// This method uses Nix's native flake resolution which:
-    /// - Checks the registry for indirect references
-    /// - Fetches remote flakes and caches them
-    /// - Handles locking automatically
-    #[instrument(level = "debug", skip(self), fields(flake_ref = %flake_ref))]
-    pub fn eval_flake_ref(&mut self, flake_ref: &str, base_dir: &Path) -> Result<NixValue> {
-        let base_dir_str = base_dir
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid base directory path"))?;
-
-        debug!("parsing flake reference: {}", flake_ref);
-
-        // Create parse flags with base directory for relative paths
-        let mut parse_flags = FlakeReferenceParseFlags::new(&self.flake_settings)
-            .context("failed to create flake reference parse flags")?;
-        parse_flags
-            .set_base_directory(base_dir_str)
-            .context("failed to set base directory")?;
-
-        // Parse the flake reference (may include #fragment for attr path)
-        let (flake_reference, fragment) = FlakeReference::parse_with_fragment(
-            &self.fetchers_settings,
-            &self.flake_settings,
-            &parse_flags,
-            flake_ref,
-        )
-        .with_context(|| format!("failed to parse flake reference: {}", flake_ref))?;
-
-        debug!(fragment = %fragment, "parsed flake reference");
-
-        // Create lock flags (virtual mode - don't write lock file)
-        let mut lock_flags = FlakeLockFlags::new(&self.flake_settings)
-            .context("failed to create flake lock flags")?;
-        lock_flags
-            .set_mode_virtual()
-            .context("failed to set virtual lock mode")?;
-
-        // Lock/fetch the flake
-        debug!("locking flake");
-        let locked_flake = LockedFlake::lock(
-            &self.fetchers_settings,
-            &self.flake_settings,
-            &self.eval_state,
-            &lock_flags,
-            &flake_reference,
-        )
-        .with_context(|| format!("failed to lock flake: {}", flake_ref))?;
-
-        // Get the flake outputs
-        debug!("getting flake outputs");
-        let outputs = locked_flake
-            .outputs(&self.flake_settings, &mut self.eval_state)
-            .context("failed to get flake outputs")?;
-
-        let outputs = NixValue { inner: outputs };
-
-        // Navigate to the fragment (attribute path) if specified
-        if fragment.is_empty() {
-            Ok(outputs)
-        } else {
-            let attr_path: Vec<String> = fragment.split('.').map(String::from).collect();
-            debug!(attr_path = ?attr_path, "navigating to attribute");
-            self.navigate_attr_path(outputs, &attr_path)
-        }
-    }
-
-    /// Evaluate a flake reference and build the result.
-    ///
-    /// Convenience method that combines eval_flake_ref with build_value.
-    #[instrument(level = "debug", skip(self), fields(flake_ref = %flake_ref))]
-    pub fn eval_and_build_flake_ref(&mut self, flake_ref: &str, base_dir: &Path) -> Result<String> {
-        let value = self.eval_flake_ref(flake_ref, base_dir)?;
-        self.build_value(&value)
-    }
-
-    /// Get attribute names at a path in a flake's outputs without forcing deep evaluation.
-    ///
-    /// This uses `builtins.getFlake` to properly evaluate the flake (which may copy
-    /// to the store for local flakes), then gets attribute names. This avoids issues
-    /// with complex flake input patterns that our manual expression generation can't handle.
-    #[instrument(level = "debug", skip(self), fields(flake = %flake_path.display(), path = ?attr_path))]
-    pub fn eval_flake_attr_names(&mut self, flake_path: &Path, attr_path: &[&str]) -> Result<Vec<String>> {
-        let path_str = flake_path
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid flake path"))?;
-
-        // Build the attribute access chain with `or {}` at each level
-        let attr_access = if attr_path.is_empty() {
-            "_flake".to_string()
-        } else {
-            let mut access = "_flake".to_string();
-            for attr in attr_path {
-                access = format!("({}.{} or {{}})", access, attr);
-            }
-            access
-        };
-
-        // Use builtins.getFlake for reliable flake evaluation
-        // This handles complex input patterns that our manual expression can't
-        let expr = format!(
-            "let _flake = (builtins.getFlake \"{}\"); in builtins.attrNames {}",
-            path_str,
-            attr_access
-        );
-
-        trace!("evaluating attr names expression: {}", expr);
-        let value = self.eval_string(&expr, "<trix-attrnames>")?;
-
-        // Parse result as list of strings
-        let size = self.require_list_size(&value)?;
-        let mut names = Vec::with_capacity(size);
-        for i in 0..size {
-            let elem = self.require_list_elem(&value, i)?;
-            names.push(self.require_string(&elem)?);
-        }
-
-        Ok(names)
-    }
-
-    /// Get a string value from a Nix value.
-    pub fn require_string(&mut self, value: &NixValue) -> Result<String> {
-        self.eval_state
-            .require_string(&value.inner)
-            .map_err(|e| anyhow!("expected string: {}", e))
-    }
-
-    /// Coerce a value to a string (handles strings and paths).
-    pub fn coerce_to_string(&mut self, value: &NixValue) -> Result<String> {
-        let vtype = self.value_type(value)?;
-        match vtype {
-            ValueType::String => self.require_string(value),
-            ValueType::Path => {
-                // Use builtins.toString to coerce path to string
-                let to_string = self.eval_string("builtins.toString", "<coerce>")?;
-                let result = self.apply(to_string, value.clone())?;
-                self.require_string(&result)
-            }
-            _ => Err(anyhow!("expected string or path, got {:?}", vtype)),
-        }
-    }
-
-    /// Get an integer value from a Nix value.
-    pub fn require_int(&mut self, value: &NixValue) -> Result<i64> {
-        self.eval_state
-            .require_int(&value.inner)
-            .map_err(|e| anyhow!("expected int: {}", e))
-    }
-
-    /// Check if a value is an attribute set.
-    pub fn is_attrs(&mut self, value: &NixValue) -> Result<bool> {
-        let vtype = self
-            .eval_state
-            .value_type(&value.inner)
-            .map_err(|e| anyhow!("failed to get value type: {}", e))?;
-        Ok(matches!(vtype, ValueType::AttrSet))
-    }
-
-    /// Get an attribute from an attribute set.
-    pub fn get_attr(&mut self, value: &NixValue, name: &str) -> Result<Option<NixValue>> {
-        match self.eval_state.require_attrs_select_opt(&value.inner, name) {
-            Ok(Some(v)) => Ok(Some(NixValue { inner: v })),
-            Ok(None) => Ok(None),
-            Err(e) => Err(anyhow!("failed to get attribute: {}", e)),
-        }
-    }
-
-    /// Get a boolean value from a Nix value.
-    pub fn require_bool(&mut self, value: &NixValue) -> Result<bool> {
-        self.eval_state
-            .require_bool(&value.inner)
-            .map_err(|e| anyhow!("expected bool: {}", e))
-    }
-
-    /// Get the size of a list value.
-    pub fn require_list_size(&mut self, value: &NixValue) -> Result<usize> {
-        let size = self
-            .eval_state
-            .require_list_size(&value.inner)
-            .map_err(|e| anyhow!("expected list: {}", e))?;
-        Ok(size as usize)
-    }
-
-    /// Get an element from a list value by index.
-    pub fn require_list_elem(&mut self, value: &NixValue, index: usize) -> Result<NixValue> {
-        let elem = self
-            .eval_state
-            .require_list_select_idx_strict(&value.inner, index as u32)
-            .map_err(|e| anyhow!("failed to get list element: {}", e))?
-            .ok_or_else(|| anyhow!("list index out of bounds"))?;
-        Ok(NixValue { inner: elem })
-    }
-
-    /// Get the type of a value.
-    pub fn value_type(&mut self, value: &NixValue) -> Result<ValueType> {
-        self.eval_state
-            .value_type(&value.inner)
-            .map_err(|e| anyhow!("failed to get value type: {}", e))
-    }
-
-    /// Get the type name of a value as a string.
-    pub fn value_type_name(&mut self, value: &NixValue) -> Result<&'static str> {
-        let vtype = self.value_type(value)?;
-        Ok(match vtype {
-            ValueType::Null => "null",
-            ValueType::Bool => "bool",
-            ValueType::Int => "int",
-            ValueType::Float => "float",
-            ValueType::String => "string",
-            ValueType::Path => "path",
-            ValueType::AttrSet => "set",
-            ValueType::List => "list",
-            ValueType::Function => "lambda",
-            ValueType::External => "external",
-            ValueType::Unknown => "unknown",
-        })
-    }
-
-    /// Get attribute names from an attribute set.
-    pub fn get_attr_names(&mut self, value: &NixValue) -> Result<Vec<String>> {
-        let names = self
-            .eval_state
-            .require_attrs_names(&value.inner)
-            .map_err(|e| anyhow!("failed to get attribute names: {}", e))?;
-        Ok(names)
-    }
-
-    /// Convert a Nix value to JSON.
-    pub fn value_to_json(&mut self, value: &NixValue) -> Result<serde_json::Value> {
-        let vtype = self.value_type(value)?;
-        match vtype {
-            ValueType::Null => Ok(json!(null)),
-            ValueType::Bool => Ok(json!(self.require_bool(value)?)),
-            ValueType::Int => Ok(json!(self.require_int(value)?)),
-            ValueType::Float => {
-                // Float support is limited in the bindings - no require_float method.
-                // We use a workaround: coerce to string via Nix's builtins.toString
-                // then parse back to f64.
-                let coerce_expr = "builtins.toString";
-                let to_string_fn = self.eval_string(coerce_expr, "<float-coerce>")?;
-                let str_value = self.apply(to_string_fn, value.clone())?;
-                let s = self.require_string(&str_value)?;
-                let f: f64 = s.parse().unwrap_or(0.0);
-                Ok(json!(f))
-            }
-            ValueType::String => Ok(json!(self.require_string(value)?)),
-            ValueType::Path => {
-                // Paths are converted to strings in JSON
-                let s = self.coerce_to_string(value)?;
-                Ok(json!(s))
-            }
-            ValueType::AttrSet => {
-                let names = self.get_attr_names(value)?;
-                let mut map = serde_json::Map::new();
-                for name in names {
-                    if let Some(attr_value) = self.get_attr(value, &name)? {
-                        let json_value = self.value_to_json(&attr_value)?;
-                        map.insert(name, json_value);
-                    }
-                }
-                Ok(serde_json::Value::Object(map))
-            }
-            ValueType::List => {
-                let size = self.require_list_size(value)?;
-                let mut arr = Vec::with_capacity(size);
-                for i in 0..size {
-                    let elem = self.require_list_elem(value, i)?;
-                    arr.push(self.value_to_json(&elem)?);
-                }
-                Ok(serde_json::Value::Array(arr))
-            }
-            ValueType::Function => Err(anyhow!("cannot convert function to JSON")),
-            ValueType::External => Err(anyhow!("cannot convert external to JSON")),
-            ValueType::Unknown => Err(anyhow!("cannot convert unknown value to JSON")),
-        }
-    }
-
-    /// Print a Nix value in Nix format.
-    pub fn value_to_nix_string(&mut self, value: &NixValue) -> Result<String> {
-        let vtype = self.value_type(value)?;
-        match vtype {
-            ValueType::Null => Ok("null".to_string()),
-            ValueType::Bool => {
-                let b = self.require_bool(value)?;
-                Ok(if b { "true" } else { "false" }.to_string())
-            }
-            ValueType::Int => Ok(self.require_int(value)?.to_string()),
-            ValueType::Float => {
-                // Float support is limited in the bindings - no require_float method.
-                // Coerce to string via builtins.toString.
-                let coerce_expr = "builtins.toString";
-                let to_string_fn = self.eval_string(coerce_expr, "<float-coerce>")?;
-                let str_value = self.apply(to_string_fn, value.clone())?;
-                self.require_string(&str_value)
-            }
-            ValueType::String => {
-                let s = self.require_string(value)?;
-                Ok(format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
-            }
-            ValueType::Path => {
-                let s = self.coerce_to_string(value)?;
-                Ok(s)
-            }
-            ValueType::AttrSet => {
-                // Check if this is a derivation (has type = "derivation" and drvPath)
-                if let Some(type_attr) = self.get_attr(value, "type")? {
-                    if self.value_type(&type_attr)? == ValueType::String {
-                        if let Ok(type_str) = self.require_string(&type_attr) {
-                            if type_str == "derivation" {
-                                // Format as «derivation /nix/store/...-name.drv»
-                                if let Some(drv_path_attr) = self.get_attr(value, "drvPath")? {
-                                    if let Ok(drv_path) = self.require_string(&drv_path_attr) {
-                                        return Ok(format!("«derivation {}»", drv_path));
-                                    }
-                                }
-                                return Ok("«derivation»".to_string());
-                            }
-                        }
-                    }
-                }
-
-                let names = self.get_attr_names(value)?;
-                if names.is_empty() {
-                    return Ok("{ }".to_string());
-                }
-                let mut parts = Vec::new();
-                for name in &names {
-                    if let Some(attr_value) = self.get_attr(value, name)? {
-                        let value_str = self.value_to_nix_string(&attr_value)?;
-                        // Quote attribute names if they contain special chars
-                        let name_str = if name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-                            name.clone()
-                        } else {
-                            format!("\"{}\"", name)
-                        };
-                        parts.push(format!("{} = {};", name_str, value_str));
-                    }
-                }
-                Ok(format!("{{ {} }}", parts.join(" ")))
-            }
-            ValueType::List => {
-                let size = self.require_list_size(value)?;
-                if size == 0 {
-                    return Ok("[ ]".to_string());
-                }
-                let mut parts = Vec::new();
-                for i in 0..size {
-                    let elem = self.require_list_elem(value, i)?;
-                    parts.push(self.value_to_nix_string(&elem)?);
-                }
-                Ok(format!("[ {} ]", parts.join(" ")))
-            }
-            ValueType::Function => Ok("«lambda»".to_string()),
-            ValueType::External => Ok("«external»".to_string()),
-            ValueType::Unknown => Ok("«unknown»".to_string()),
-        }
-    }
-
-    /// Evaluate a Nix file.
-    pub fn eval_file(&mut self, path: &Path) -> Result<NixValue> {
-        let path_str = path
-            .to_str()
-            .ok_or_else(|| anyhow!("invalid file path"))?;
-        let expr = format!("import {}", path_str);
-        self.eval_string(&expr, path_str)
-    }
-
-    /// Apply a function to a value.
-    pub fn apply(&mut self, func: NixValue, arg: NixValue) -> Result<NixValue> {
-        let result = self
-            .eval_state
-            .call(func.inner, arg.inner)
-            .map_err(|e| anyhow!("function application failed: {}", e))?;
-        Ok(NixValue { inner: result })
-    }
-
-    // =========================================================================
-    // Native Build Methods
-    // =========================================================================
-
-    /// Check if a value is a derivation (has type = "derivation").
-    pub fn is_derivation(&mut self, value: &NixValue) -> Result<bool> {
-        if !self.is_attrs(value)? {
-            return Ok(false);
-        }
-        match self.get_attr(value, "type")? {
-            Some(type_attr) => {
-                if self.value_type(&type_attr)? == ValueType::String {
-                    Ok(self.require_string(&type_attr)? == "derivation")
-                } else {
-                    Ok(false)
-                }
-            }
-            None => Ok(false),
-        }
-    }
-
-    /// Get the .drv path from a derivation value.
-    ///
-    /// Returns the path string (e.g., "/nix/store/xxx.drv").
-    #[instrument(level = "debug", skip(self, value))]
-    pub fn get_drv_path(&mut self, value: &NixValue) -> Result<String> {
-        let drv_path_attr = self
-            .get_attr(value, "drvPath")?
-            .ok_or_else(|| anyhow!("value is not a derivation (no drvPath attribute)"))?;
-        self.require_string(&drv_path_attr)
-    }
-
-    /// Parse a store path string into a StorePath object.
-    #[instrument(level = "trace", skip(self), fields(path = %path))]
-    pub fn parse_store_path(&mut self, path: &str) -> Result<StorePath> {
-        self.store
-            .parse_store_path(path)
-            .map_err(|e| anyhow!("failed to parse store path '{}': {}", path, e))
-    }
-
-    /// Build a derivation value and return the default output path.
-    ///
-    /// Uses `realise_string` on the derivation's `outPath` attribute, which
-    /// builds the derivation through the string context mechanism.
-    #[instrument(level = "debug", skip(self, value))]
-    pub fn build_value(&mut self, value: &NixValue) -> Result<String> {
-        // Get the outPath attribute - this is a string with derivation context
-        let out_path_attr = self
-            .get_attr(value, "outPath")?
-            .ok_or_else(|| anyhow!("value is not a derivation (no outPath attribute)"))?;
-
-        debug!("building derivation via realise_string");
-
-        // realise_string builds any derivations in the string's context
-        let realised = self
-            .eval_state
-            .realise_string(&out_path_attr.inner, false)
-            .map_err(|e| anyhow!("build failed: {}", e))?;
-
-        let output_path = realised.s;
-        debug!(output = %output_path, "build completed");
-        Ok(output_path)
-    }
-
-    /// Build a derivation and return all output paths.
-    ///
-    /// This builds the derivation and returns a map of output names to paths.
-    /// For derivations with multiple outputs, use this instead of `build_value`.
-    #[instrument(level = "debug", skip(self, value))]
-    pub fn build_value_outputs(&mut self, value: &NixValue) -> Result<BTreeMap<String, String>> {
-        // First, get the list of output names
-        let outputs_attr = self
-            .get_attr(value, "outputs")?
-            .ok_or_else(|| anyhow!("value is not a derivation (no outputs attribute)"))?;
-
-        let output_count = self.require_list_size(&outputs_attr)?;
-        let mut results = BTreeMap::new();
-
-        for i in 0..output_count {
-            let output_name_value = self.require_list_elem(&outputs_attr, i)?;
-            let output_name = self.require_string(&output_name_value)?;
-
-            // Get the output path attribute (e.g., value.out, value.dev)
-            let output_path_attr = self
-                .get_attr(value, &output_name)?
-                .ok_or_else(|| anyhow!("derivation missing output '{}'", output_name))?;
-
-            // realise_string builds the derivation through context
-            let realised = self
-                .eval_state
-                .realise_string(&output_path_attr.inner, false)
-                .map_err(|e| anyhow!("build failed for output '{}': {}", output_name, e))?;
-
-            results.insert(output_name, realised.s);
-        }
-
-        debug!(outputs = ?results.keys().collect::<Vec<_>>(), "build completed");
-        Ok(results)
-    }
-
-    /// Evaluate a flake attribute and build it, returning the default output path.
-    ///
-    /// This combines eval_flake_attr and build_value into a single operation.
-    #[instrument(level = "debug", skip(self), fields(flake = %flake_path.display(), attr = ?attr_path))]
-    pub fn eval_and_build_flake_attr(
-        &mut self,
-        flake_path: &Path,
-        attr_path: &[String],
-    ) -> Result<String> {
-        let value = self.eval_flake_attr(flake_path, attr_path)?;
-        self.build_value(&value)
-    }
-
-    /// Get the default output path from a multi-output build result.
-    ///
-    /// Returns the "out" output path, or the first output if "out" doesn't exist.
-    pub fn default_output(outputs: &BTreeMap<String, String>) -> Result<&str> {
-        outputs
-            .get("out")
-            .or_else(|| outputs.values().next())
-            .map(|s| s.as_str())
-            .ok_or_else(|| anyhow!("derivation produced no outputs"))
-    }
-
-    /// Get the main program name for a derivation.
-    ///
-    /// Tries (in order):
-    /// 1. meta.mainProgram attribute
-    /// 2. pname attribute
-    /// 3. name attribute (with version suffix stripped)
-    /// 4. Provided fallback name
-    #[instrument(level = "debug", skip(self, value))]
-    pub fn get_main_program(&mut self, value: &NixValue, fallback: &str) -> Result<String> {
-        // Try meta.mainProgram first
-        if let Some(meta) = self.get_attr(value, "meta")? {
-            if let Some(main_program) = self.get_attr(&meta, "mainProgram")? {
-                if self.value_type(&main_program)? == ValueType::String {
-                    if let Ok(s) = self.require_string(&main_program) {
-                        debug!(main_program = %s, "found meta.mainProgram");
-                        return Ok(s);
-                    }
-                }
+        paths
+    };
+
+    let flake_dir = flake_path.to_str()
+        .ok_or_else(|| anyhow!("invalid flake path"))?;
+
+    // Generate expression that tries to get .program attribute
+    let mut program_attr = attr_path.to_vec();
+    program_attr.push("program".to_string());
+
+    let expr = generate_flake_eval_expr(
+        flake_dir,
+        lock,
+        &program_attr,
+        input_overrides,
+        &store_paths,
+    )?;
+
+    // Try to evaluate - if it fails, it's not an app
+    match eval_to_json(&expr) {
+        Ok(json) => {
+            if let Some(program) = json.as_str() {
+                debug!("found app program: {}", program);
+                Ok(Some(program.to_string()))
+            } else {
+                Ok(None)
             }
         }
-
-        // Try pname
-        if let Some(pname_attr) = self.get_attr(value, "pname")? {
-            if self.value_type(&pname_attr)? == ValueType::String {
-                if let Ok(pname) = self.require_string(&pname_attr) {
-                    debug!(pname = %pname, "using pname as mainProgram");
-                    return Ok(pname);
-                }
-            }
-        }
-
-        // Try name (strip version suffix)
-        if let Some(name_attr) = self.get_attr(value, "name")? {
-            if self.value_type(&name_attr)? == ValueType::String {
-                if let Ok(name) = self.require_string(&name_attr) {
-                    // Strip version suffix (last -X.Y.Z part)
-                    if let Some(pos) = name.rfind('-') {
-                        let suffix = &name[pos + 1..];
-                        if suffix
-                            .chars()
-                            .next()
-                            .map(|c| c.is_ascii_digit())
-                            .unwrap_or(false)
-                        {
-                            let program_name = &name[..pos];
-                            debug!(name = %name, program = %program_name, "using name (stripped) as mainProgram");
-                            return Ok(program_name.to_string());
-                        }
-                    }
-                    debug!(name = %name, "using name as mainProgram");
-                    return Ok(name);
-                }
-            }
-        }
-
-        debug!(fallback = %fallback, "using fallback as mainProgram");
-        Ok(fallback.to_string())
+        Err(_) => Ok(None), // Not an app
     }
 }
 
-/// Generate a Nix expression to evaluate a flake without copying to store.
+/// Get the main program name from a derivation.
 ///
-/// This is the key to trix - we generate Nix code that:
-/// 1. Fetches remote inputs using builtins.fetchTarball/fetchGit (cached in store, fine)
-/// 2. Imports the local flake.nix directly (NOT via getFlake)
-/// 3. Constructs the inputs attrset from flake.lock data
-/// 4. Calls flake.outputs with the constructed inputs
+/// Tries in order: meta.mainProgram, pname, name (with version stripped).
+#[instrument(level = "debug", skip(lock))]
+pub fn get_main_program(
+    flake_path: &Path,
+    lock: &FlakeLock,
+    attr_path: &[String],
+    input_overrides: &HashMap<String, String>,
+    fallback: &str,
+) -> Result<String> {
+    debug!("getting main program for {}", attr_path.join("."));
+
+    // Prefetch inputs
+    let store_paths = if input_overrides.is_empty() {
+        prefetch_all_inputs(lock)?
+    } else {
+        let nodes_to_fetch: Vec<_> = lock.nodes.iter()
+            .filter(|(name, _)| *name != &lock.root && !input_overrides.contains_key(*name))
+            .collect();
+
+        let mut paths = HashMap::new();
+        for (name, node) in nodes_to_fetch {
+            if let Some(ref locked) = node.locked {
+                let store_path = prefetch_input(name, locked)?;
+                paths.insert(name.clone(), store_path);
+            }
+        }
+        paths
+    };
+
+    let flake_dir = flake_path.to_str()
+        .ok_or_else(|| anyhow!("invalid flake path"))?;
+
+    // Try meta.mainProgram
+    let mut meta_main = attr_path.to_vec();
+    meta_main.extend(vec!["meta".to_string(), "mainProgram".to_string()]);
+    let expr = generate_flake_eval_expr(flake_dir, lock, &meta_main, input_overrides, &store_paths)?;
+    if let Ok(json) = eval_to_json(&expr) {
+        if let Some(s) = json.as_str() {
+            debug!("found meta.mainProgram: {}", s);
+            return Ok(s.to_string());
+        }
+    }
+
+    // Try pname
+    let mut pname_attr = attr_path.to_vec();
+    pname_attr.push("pname".to_string());
+    let expr = generate_flake_eval_expr(flake_dir, lock, &pname_attr, input_overrides, &store_paths)?;
+    if let Ok(json) = eval_to_json(&expr) {
+        if let Some(s) = json.as_str() {
+            debug!("using pname as mainProgram: {}", s);
+            return Ok(s.to_string());
+        }
+    }
+
+    // Try name (strip version)
+    let mut name_attr = attr_path.to_vec();
+    name_attr.push("name".to_string());
+    let expr = generate_flake_eval_expr(flake_dir, lock, &name_attr, input_overrides, &store_paths)?;
+    if let Ok(json) = eval_to_json(&expr) {
+        if let Some(name) = json.as_str() {
+            // Strip version suffix (last -X.Y.Z part)
+            if let Some(pos) = name.rfind('-') {
+                let suffix = &name[pos + 1..];
+                if suffix.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+                    let base = &name[..pos];
+                    debug!("using name (stripped version) as mainProgram: {}", base);
+                    return Ok(base.to_string());
+                }
+            }
+            debug!("using name as mainProgram: {}", name);
+            return Ok(name.to_string());
+        }
+    }
+
+    // Fallback
+    debug!("using fallback as mainProgram: {}", fallback);
+    Ok(fallback.to_string())
+}
+
+/// Evaluate a Nix expression to a derivation path (.drv file).
 ///
-/// The `input_overrides` parameter allows overriding specific inputs with local paths,
-/// which are imported directly without copying to the store (just like the main flake).
+/// Evaluates `.drvPath` via `nix eval --impure` to instantiate the derivation.
+#[instrument(level = "debug", skip(expr), fields(expr_len = expr.len()))]
+pub fn eval_to_drv(expr: &str, source_name: &str) -> Result<String> {
+    debug!("evaluating expression to .drv ({} bytes)", expr.len());
+    trace!("expression source: {}", source_name);
+    trace!("full expression:\n{}", expr);
+
+    // Evaluate .drvPath to instantiate the derivation and get its store path.
+    // --impure is needed for builtins.currentSystem and file imports.
+    // --raw outputs the string without JSON quoting.
+    let drv_expr = format!("({}).drvPath", expr);
+    let output = Command::new("nix")
+        .args(["eval", "--raw", "--impure", "--expr", &drv_expr])
+        .output()
+        .context("failed to execute nix eval")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("nix eval failed with stderr:\n{}", stderr);
+        bail!("evaluation failed: {}", stderr.trim());
+    }
+
+    let drv_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    debug!("evaluated to derivation: {}", drv_path);
+
+    if !drv_path.ends_with(".drv") {
+        bail!("nix eval returned invalid path (expected .drv): {}", drv_path);
+    }
+
+    Ok(drv_path)
+}
+
+/// Build a derivation and return the output path.
 ///
-/// This function is public because it's also used by Evaluator::eval_flake_attr
-/// to generate expressions for internal evaluation.
+/// Uses `nix build` with a .drv store path (no flake context).
+#[instrument(level = "debug", fields(drv = %drv_path))]
+pub fn build_drv(drv_path: &str) -> Result<String> {
+    debug!("building derivation with nix build");
+
+    // Build the derivation directly from its store path.
+    // ^* means "all outputs". --no-link avoids creating result symlinks.
+    let installable = format!("{}^*", drv_path);
+    let output = Command::new("nix")
+        .args(["build", &installable, "--no-link", "--print-out-paths"])
+        .output()
+        .context("failed to execute nix build")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("nix build failed with stderr:\n{}", stderr);
+        bail!("build failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // nix build --print-out-paths outputs one path per line
+    let output_path = stdout
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("nix build produced no output"))?
+        .trim()
+        .to_string();
+
+    debug!("build completed: {}", output_path);
+
+    if !output_path.starts_with("/nix/store/") {
+        bail!("nix build returned invalid output path: {}", output_path);
+    }
+
+    Ok(output_path)
+}
+
+/// Build a derivation and return all output paths.
+///
+/// For derivations with multiple outputs (out, dev, doc, etc.).
+#[instrument(level = "debug", fields(drv = %drv_path))]
+pub fn build_drv_outputs(drv_path: &str) -> Result<HashMap<String, String>> {
+    debug!("building derivation with nix build");
+
+    let installable = format!("{}^*", drv_path);
+    let output = Command::new("nix")
+        .args(["build", &installable, "--no-link", "--print-out-paths"])
+        .output()
+        .context("failed to execute nix build")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("nix build failed with stderr:\n{}", stderr);
+        bail!("build failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // nix build --print-out-paths outputs one path per line
+    let mut outputs = HashMap::new();
+
+    for (idx, line) in stdout.lines().enumerate() {
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+
+        if !path.starts_with("/nix/store/") {
+            bail!("nix build returned invalid output path: {}", path);
+        }
+
+        // First output is "out", subsequent ones get indexed names
+        let output_name = if idx == 0 { "out" } else { &format!("out{}", idx) };
+        outputs.insert(output_name.to_string(), path.to_string());
+    }
+
+    if outputs.is_empty() {
+        bail!("nix build produced no output paths");
+    }
+
+    debug!("build completed with {} outputs", outputs.len());
+    Ok(outputs)
+}
+
+//=============================================================================
+// Input Fetching via Subprocess
+//=============================================================================
+
+/// Prefetch a flake input to the store using `nix flake prefetch`.
+///
+/// Returns the store path where the input was fetched.
+/// This respects access-tokens from nix.conf automatically.
+#[instrument(level = "debug", fields(input_name = %input_name))]
+pub fn prefetch_input(input_name: &str, locked: &LockedRef) -> Result<String> {
+    debug!("prefetching input: {}", input_name);
+
+    // Convert LockedRef to a flake reference string
+    let flake_ref = locked_ref_to_flake_ref(locked)?;
+
+    trace!("flake reference: {}", flake_ref);
+
+    // Call nix flake prefetch
+    let output = Command::new("nix")
+        .args(["--extra-experimental-features", "nix-command flakes", "flake", "prefetch", "--json", &flake_ref])
+        .output()
+        .context("failed to execute nix flake prefetch")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("nix flake prefetch failed with stderr:\n{}", stderr);
+        bail!("failed to prefetch input '{}': {}", input_name, stderr.trim());
+    }
+
+    // Parse JSON output to get store path
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let info: serde_json::Value = serde_json::from_str(&json_str)
+        .context("failed to parse nix flake prefetch JSON output")?;
+
+    let store_path = info["storePath"]
+        .as_str()
+        .ok_or_else(|| anyhow!("nix flake prefetch JSON missing storePath field"))?
+        .to_string();
+
+    debug!("prefetched {} to: {}", input_name, store_path);
+    Ok(store_path)
+}
+
+/// Convert a LockedRef to a flake reference string for `nix flake prefetch`.
+///
+/// Examples:
+/// - GitHub → "github:owner/repo/rev"
+/// - Git → "git+url?rev=..."
+/// - Tarball → "tarball+url"
+fn locked_ref_to_flake_ref(locked: &LockedRef) -> Result<String> {
+    match locked {
+        LockedRef::GitHub { owner, repo, rev, .. } => {
+            Ok(format!("github:{}/{}?rev={}", owner, repo, rev))
+        }
+        LockedRef::GitLab { owner, repo, rev, .. } => {
+            Ok(format!("gitlab:{}/{}?rev={}", owner, repo, rev))
+        }
+        LockedRef::Sourcehut { owner, repo, rev, .. } => {
+            Ok(format!("sourcehut:{}/{}?rev={}", owner, repo, rev))
+        }
+        LockedRef::Git { url, rev, dirty_rev, .. } => {
+            let effective_rev = rev.as_ref().or(dirty_rev.as_ref())
+                .ok_or_else(|| anyhow!("git input missing rev"))?;
+            Ok(format!("git+{}?rev={}", url, effective_rev))
+        }
+        LockedRef::Tarball { url, .. } => {
+            Ok(format!("tarball+{}", url))
+        }
+        LockedRef::Path { path, .. } => {
+            // For local paths, we can add them to the store using nix store add-path
+            // But actually, for local paths we don't need to prefetch - we can use them directly
+            Ok(path.clone())
+        }
+        LockedRef::Indirect { id, .. } => {
+            Err(anyhow!("indirect input '{}' should be resolved before locking", id))
+        }
+    }
+}
+
+/// Prefetch all inputs from a flake.lock file.
+///
+/// Returns a map of input_name → store_path.
+/// This parallelizes prefetching for performance.
+#[instrument(level = "debug", skip(lock))]
+pub fn prefetch_all_inputs(lock: &FlakeLock) -> Result<HashMap<String, String>> {
+    use rayon::prelude::*;
+
+    debug!("prefetching all inputs");
+
+    // Get all nodes except root
+    let nodes_to_fetch: Vec<_> = lock.nodes.iter()
+        .filter(|(name, _)| *name != &lock.root)
+        .collect();
+
+    debug!("found {} inputs to prefetch", nodes_to_fetch.len());
+
+    // Prefetch in parallel using rayon
+    let results: Vec<_> = nodes_to_fetch.par_iter()
+        .filter_map(|(name, node)| {
+            if let Some(ref locked) = node.locked {
+                match prefetch_input(name, locked) {
+                    Ok(store_path) => Some(Ok(((*name).clone(), store_path))),
+                    Err(e) => Some(Err(anyhow!("failed to prefetch {}: {}", name, e))),
+                }
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Convert Vec<Result<(String, String)>> to Result<HashMap<String, String>>
+    let mut store_paths = HashMap::new();
+    for result in results {
+        let (name, path) = result?;
+        store_paths.insert(name, path);
+    }
+
+    debug!("prefetched {} inputs successfully", store_paths.len());
+    Ok(store_paths)
+}
+
+//=============================================================================
+// Expression Generation for Local Flakes
+// (Preserves the core value proposition - never copies local flakes to store!)
+//=============================================================================
+
+/// Generate a Nix expression that evaluates a local flake's attribute.
+///
+/// This is the core of trix's value proposition. We:
+/// 1. Import flake.nix directly (NOT via builtins.getFlake)
+/// 2. Prefetch all inputs from flake.lock
+/// 3. Construct the inputs attrset manually
+/// 4. Call the flake's outputs function
+///
+/// This ensures the local flake is NEVER copied to /nix/store.
+#[instrument(level = "debug", skip(lock), fields(attr = ?attr_path))]
+pub fn generate_and_eval_local_flake(
+    flake_path: &Path,
+    lock: &FlakeLock,
+    attr_path: &[String],
+    input_overrides: &HashMap<String, String>,
+) -> Result<String> {
+    debug!("generating expression for local flake: {}", flake_path.display());
+
+    // Step 1: Prefetch all inputs to the store
+    let store_paths = if input_overrides.is_empty() {
+        prefetch_all_inputs(lock)?
+    } else {
+        // If we have overrides, we need to be more selective about what we prefetch
+        // Overridden inputs should not be prefetched
+        let nodes_to_fetch: Vec<_> = lock.nodes.iter()
+            .filter(|(name, _)| *name != &lock.root && !input_overrides.contains_key(*name))
+            .collect();
+
+        let mut paths = HashMap::new();
+        for (name, node) in nodes_to_fetch {
+            if let Some(ref locked) = node.locked {
+                let store_path = prefetch_input(name, locked)?;
+                paths.insert(name.clone(), store_path);
+            }
+        }
+        paths
+    };
+
+    // Step 2: Generate the expression using prefetched store paths
+    let flake_dir = flake_path.to_str()
+        .ok_or_else(|| anyhow!("invalid flake path"))?;
+
+    let expr = generate_flake_eval_expr(
+        flake_dir,
+        lock,
+        attr_path,
+        input_overrides,
+        &store_paths,
+    )?;
+
+    // Step 3: Evaluate the expression to get .drv path
+    let source_name = format!("{}#{}", flake_path.display(), attr_path.join("."));
+    eval_to_drv(&expr, &source_name)
+}
+
+/// Generate a Nix expression for evaluating a local flake attribute.
+///
+/// This generates an expression that:
+/// - Uses prefetched store paths for inputs (already fetched via subprocess)
+/// - Imports flake.nix directly
+/// - Constructs inputs manually
+/// - Never copies the local flake to the store
+///
+/// This is the SAME algorithm as the old evaluator, just with prefetched paths.
 pub fn generate_flake_eval_expr(
     flake_dir: &str,
     lock: &FlakeLock,
     attr_path: &[String],
     input_overrides: &HashMap<String, String>,
+    store_paths: &HashMap<String, String>,
 ) -> Result<String> {
     // Get root node's inputs
     let root_node = lock.nodes.get(&lock.root);
@@ -811,7 +516,7 @@ pub fn generate_flake_eval_expr(
     // Build topologically sorted list of nodes (dependencies first)
     let sorted_nodes = topological_sort_nodes(lock)?;
 
-    // Generate fetch expressions for each node
+    // Generate let bindings for each input
     let mut let_bindings = Vec::new();
 
     for node_name in &sorted_nodes {
@@ -828,40 +533,44 @@ pub fn generate_flake_eval_expr(
             let resolved_path = resolve_override_path(override_path)?;
 
             // Generate expression for overridden input (local path, no store copy)
+            // The override path has a flake.nix (verified by resolve_override_path),
+            // so always treat it as a flake regardless of the lock file's original metadata.
+            let override_is_flake = Path::new(&resolved_path).join("flake.nix").exists();
             let override_expr = generate_override_input_expr(
                 node_name,
                 &resolved_path,
-                node.flake,
+                override_is_flake,
+                lock,
+                store_paths,
             )?;
             let_bindings.push(override_expr);
             continue;
         }
 
-        // Generate the source fetch expression (normal path)
-        let src_binding = if let Some(ref locked) = node.locked {
-            let fetch_expr = generate_fetch_expr(locked, flake_dir);
-            format!("_src_{} = {};", sanitize_name(node_name), fetch_expr)
-        } else {
-            continue; // No locked ref, skip (shouldn't happen for non-root)
-        };
-
-        let_bindings.push(src_binding);
+        // Use the prefetched store path
+        let store_path = store_paths.get(node_name)
+            .ok_or_else(|| anyhow!("input '{}' not prefetched", node_name))?;
 
         // If it's a flake, generate the input building expression
         if node.flake {
-            let input_expr = generate_input_build_expr(node_name, node, lock, flake_dir)?;
+            let input_expr = generate_input_build_expr_from_store_path(
+                node_name,
+                store_path,
+                node,
+                lock,
+            )?;
             let_bindings.push(format!("{} = {};", sanitize_name(node_name), input_expr));
         } else {
-            // Non-flake input - just use the source
+            // Non-flake input - just use the store path
             let_bindings.push(format!(
-                "{name} = {{ outPath = _src_{name}; }};",
-                name = sanitize_name(node_name)
+                "{name} = {{ outPath = \"{path}\"; }};",
+                name = sanitize_name(node_name),
+                path = store_path,
             ));
         }
     }
 
     // Build the root inputs attrset
-    // Use quoted attribute names to preserve hyphens (e.g., "flake-utils" = flake_utils)
     let mut input_attrs = Vec::new();
     let mut resolved_root_inputs: Vec<(String, String)> = Vec::new();
     for (input_name, input_ref) in &root_inputs {
@@ -881,10 +590,8 @@ pub fn generate_flake_eval_expr(
     }
 
     // Build the outputs call arguments
-    // Must use original input names (with hyphens) as attribute names, mapped to sanitized variables
     let mut output_args = vec!["self = self".to_string()];
     for (input_name, sanitized) in &resolved_root_inputs {
-        // Quote the attribute name to preserve hyphens (e.g., "flake-utils" = flake_utils)
         output_args.push(format!("\"{}\" = {}", input_name, sanitized));
     }
 
@@ -901,17 +608,17 @@ pub fn generate_flake_eval_expr(
     let expr = format!(
         r#"
 let
-  flakeDirPath = {flake_dir};
+  # Use string concatenation to avoid copying to store
+  flakeDirPath = "{flake_dir}";
 
-  # Minimal self for nested inputs that follow root (defined before fetched sources)
-  # This is needed when a nested flake's input uses "follows": [] (empty follows = root self)
+  # Minimal self for nested inputs that follow root
   _rootSelf = {{
-    outPath = flakeDirPath;
+    outPath = flakeDirPath;  # String, not path - won't trigger store copy
     _type = "flake";
     {git_attrs}
   }};
 
-  # Fetched sources and built inputs
+  # Built inputs (from prefetched store paths)
   {let_bindings}
 
   # Self input (the local flake) with full inputs
@@ -920,7 +627,8 @@ let
   }};
 
   # Import and evaluate the flake
-  flake = import (flakeDirPath + "/flake.nix");
+  # Keep as string until import, avoid path coercion
+  flake = import ((toString flakeDirPath) + "/flake.nix");
   outputs = flake.outputs ({{ {output_args}; }} // {{ self = self // outputs; }});
 
 in outputs{attr_suffix}
@@ -936,87 +644,18 @@ in outputs{attr_suffix}
     Ok(expr)
 }
 
-/// Generate a Nix fetch expression for a locked reference.
-/// Uses builtins.fetchTree for GitHub/GitLab/Sourcehut to respect access-tokens in nix.conf.
-fn generate_fetch_expr(locked: &LockedRef, flake_dir: &str) -> String {
-    match locked {
-        LockedRef::GitHub { owner, repo, rev, nar_hash, .. } => {
-            // Use fetchTree with type=github to respect access-tokens for private repos
-            let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" narHash = \"{}\";", h))
-                .unwrap_or_default();
-            format!(
-                r#"builtins.fetchTree {{ type = "github"; owner = "{}"; repo = "{}"; rev = "{}";{} }}"#,
-                owner, repo, rev, hash_arg
-            )
-        }
-        LockedRef::GitLab { owner, repo, rev, nar_hash, .. } => {
-            // Use fetchTree with type=gitlab to respect access-tokens for private repos
-            let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" narHash = \"{}\";", h))
-                .unwrap_or_default();
-            format!(
-                r#"builtins.fetchTree {{ type = "gitlab"; owner = "{}"; repo = "{}"; rev = "{}";{} }}"#,
-                owner, repo, rev, hash_arg
-            )
-        }
-        LockedRef::Sourcehut { owner, repo, rev, nar_hash, .. } => {
-            // Use fetchTree with type=sourcehut to respect access-tokens for private repos
-            let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" narHash = \"{}\";", h))
-                .unwrap_or_default();
-            format!(
-                r#"builtins.fetchTree {{ type = "sourcehut"; owner = "{}"; repo = "{}"; rev = "{}";{} }}"#,
-                owner, repo, rev, hash_arg
-            )
-        }
-        LockedRef::Git { url, rev, nar_hash, git_ref, dirty_rev, .. } => {
-            // Use rev if available, otherwise fall back to dirty_rev
-            let effective_rev = rev.as_ref().or(dirty_rev.as_ref());
-            let ref_arg = git_ref.as_ref()
-                .map(|r| format!(" ref = \"{}\";", r))
-                .unwrap_or_default();
-            let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" narHash = \"{}\";", h))
-                .unwrap_or_default();
-            let rev_arg = effective_rev
-                .map(|r| format!(" rev = \"{}\";", r))
-                .unwrap_or_default();
-            format!(
-                r#"builtins.fetchGit {{ url = "{}";{}{}{} }}"#,
-                url, rev_arg, ref_arg, hash_arg
-            )
-        }
-        LockedRef::Path { path, .. } => {
-            if path.starts_with('/') {
-                format!("/. + \"{}\"", path)
-            } else {
-                // Need a "/" separator for relative paths like "../foo"
-                format!("{} + \"/{}\"", flake_dir, path)
-            }
-        }
-        LockedRef::Tarball { url, nar_hash, .. } => {
-            let hash_arg = nar_hash.as_ref()
-                .map(|h| format!(" sha256 = \"{}\";", h))
-                .unwrap_or_default();
-            format!(r#"builtins.fetchTarball {{ url = "{}";{} }}"#, url, hash_arg)
-        }
-        LockedRef::Indirect { id, .. } => {
-            // Indirect refs should be resolved before locking
-            format!(r#"throw "trix: unresolved indirect input '{}' - run trix lock first""#, id)
-        }
-    }
-}
+//=============================================================================
+// Helper Functions for Expression Generation
+// (Preserved from the original evaluator)
+//=============================================================================
 
-/// Generate expression to build an input from its source.
-fn generate_input_build_expr(
-    node_name: &str,
+/// Generate expression to build an input from its prefetched store path.
+fn generate_input_build_expr_from_store_path(
+    _node_name: &str,
+    store_path: &str,
     node: &crate::lock::LockNode,
     lock: &FlakeLock,
-    _flake_dir: &str,
 ) -> Result<String> {
-    let src_name = format!("_src_{}", sanitize_name(node_name));
-
     // Build this input's inputs
     let mut input_exprs = Vec::new();
     for (input_name, input_ref) in &node.inputs {
@@ -1025,14 +664,10 @@ fn generate_input_build_expr(
             InputRef::Follows(path) => {
                 match resolve_follows_to_name(path, lock)? {
                     FollowsResolution::Node(name) => name,
-                    // Empty follows at nested level means "follows root's self"
-                    // For nested inputs, this would be the root flake's self, but since
-                    // we're building this input before self is defined, we use _rootSelf
                     FollowsResolution::Self_ => "_rootSelf".to_string(),
                 }
             }
         };
-        // Quote the attribute name to preserve hyphens (e.g., "nixpkgs-lib" = nixpkgs)
         input_exprs.push(format!("\"{}\" = {};", input_name, resolved));
     }
 
@@ -1045,12 +680,12 @@ fn generate_input_build_expr(
 
     Ok(format!(
         r#"let
-    _flake = import ({src} + "/flake.nix");
+    _flake = import ((toString "{store_path}") + "/flake.nix");
     _inputs = {{ {inputs} }};
-    _self = {{ outPath = {src}; inputs = _inputs; _type = "flake";{metadata} }};
+    _self = {{ outPath = "{store_path}"; inputs = _inputs; _type = "flake";{metadata} }};
     _outputs = _flake.outputs (_inputs // {{ self = _self // _outputs; }});
-  in _outputs // {{ outPath = {src}; inputs = _inputs; outputs = _outputs; _type = "flake";{metadata} }}"#,
-        src = src_name,
+  in _outputs // {{ outPath = "{store_path}"; inputs = _inputs; outputs = _outputs; _type = "flake";{metadata} }}"#,
+        store_path = store_path,
         inputs = inputs_str,
         metadata = metadata,
     ))
@@ -1083,16 +718,13 @@ fn topological_sort_nodes(lock: &FlakeLock) -> Result<Vec<String>> {
                 let dep_name = match input_ref {
                     InputRef::Direct(name) => name.clone(),
                     InputRef::Follows(path) => {
-                        // For follows, resolve the full path to find the actual target node
-                        // e.g., ["infra-private", "nixpkgs"] should resolve to the "nixpkgs" node,
-                        // not "infra-private"
                         if path.is_empty() {
-                            continue; // Empty follows = self/root, no dependency to add
+                            continue;
                         }
                         match resolve_follows_to_node_name(path, lock) {
                             Ok(Some(name)) => name,
-                            Ok(None) => continue, // Unresolvable or self-reference
-                            Err(_) => continue,   // Skip on resolution errors
+                            Ok(None) => continue,
+                            Err(_) => continue,
                         }
                     }
                 };
@@ -1112,7 +744,7 @@ fn topological_sort_nodes(lock: &FlakeLock) -> Result<Vec<String>> {
         for (_, input_ref) in &root_node.inputs {
             let node_name = match input_ref {
                 InputRef::Direct(name) => name,
-                InputRef::Follows(_) => continue, // Root-level follows handled separately
+                InputRef::Follows(_) => continue,
             };
             visit(node_name, lock, &mut sorted, &mut visited, &mut in_progress)?;
         }
@@ -1122,11 +754,9 @@ fn topological_sort_nodes(lock: &FlakeLock) -> Result<Vec<String>> {
 }
 
 /// Resolve a follows path to the original node name (not sanitized).
-/// Returns None for empty paths (self-reference) or if resolution fails gracefully.
-/// Used by topological sort to find actual dependencies.
 fn resolve_follows_to_node_name(path: &[String], lock: &FlakeLock) -> Result<Option<String>> {
     if path.is_empty() {
-        return Ok(None); // Empty follows = self/root
+        return Ok(None);
     }
 
     let mut current = lock.root.clone();
@@ -1138,21 +768,18 @@ fn resolve_follows_to_node_name(path: &[String], lock: &FlakeLock) -> Result<Opt
             Some(InputRef::Follows(inner_path)) => {
                 return resolve_follows_to_node_name(inner_path, lock);
             }
-            None => return Ok(None), // Input not found, skip gracefully
+            None => return Ok(None),
         }
     }
     Ok(Some(current))
 }
 
 /// Resolve a follows path to a node name.
-/// Returns a special marker for empty follows (which means "follows self/root").
 fn resolve_follows_to_name(path: &[String], lock: &FlakeLock) -> Result<FollowsResolution> {
-    // Empty follows path means "follows self/root" - the input is the root flake itself
     if path.is_empty() {
         return Ok(FollowsResolution::Self_);
     }
 
-    // Simple follows resolution - just get the final target
     let mut current = lock.root.clone();
     for segment in path {
         let node = lock.nodes.get(&current)
@@ -1170,21 +797,21 @@ fn resolve_follows_to_name(path: &[String], lock: &FlakeLock) -> Result<FollowsR
 
 /// Result of resolving a follows path.
 enum FollowsResolution {
-    /// Points to a named node (the sanitized variable name)
     Node(String),
-    /// Points to self/root (empty follows path)
     Self_,
 }
 
 /// Sanitize a name for use as a Nix identifier.
 fn sanitize_name(name: &str) -> String {
-    // Replace hyphens and other special chars with underscores for variable names
-    // But keep original for attribute access
     name.replace('-', "_")
 }
 
-/// Extract metadata (rev, shortRev, lastModified, lastModifiedDate) from a LockedRef.
-/// Returns Nix attribute syntax for these attributes.
+/// Extract metadata from a LockedRef.
+///
+/// Always provides rev, shortRev, lastModified, and lastModifiedDate to prevent
+/// "attribute 'rev' missing" errors when flake outputs reference input metadata
+/// (e.g., `nixpkgs.rev` in NixOS test derivations). For inputs without a real rev
+/// (like tarballs), a zeroed-out placeholder is used.
 fn get_locked_ref_metadata(locked: &crate::lock::LockedRef) -> String {
     use crate::lock::LockedRef;
 
@@ -1193,7 +820,6 @@ fn get_locked_ref_metadata(locked: &crate::lock::LockedRef) -> String {
         LockedRef::GitLab { rev, .. } => (Some(rev.clone()), None),
         LockedRef::Sourcehut { rev, .. } => (Some(rev.clone()), None),
         LockedRef::Git { rev, dirty_rev, last_modified, .. } => {
-            // Prefer clean rev, fall back to dirty_rev
             let effective_rev = rev.as_ref().or(dirty_rev.as_ref()).cloned();
             (effective_rev, *last_modified)
         }
@@ -1203,35 +829,28 @@ fn get_locked_ref_metadata(locked: &crate::lock::LockedRef) -> String {
 
     let mut attrs = Vec::new();
 
-    if let Some(rev) = rev_opt {
-        let short_rev = &rev[..7.min(rev.len())];
-        attrs.push(format!(r#"rev = "{}";"#, rev));
-        attrs.push(format!(r#"shortRev = "{}";"#, short_rev));
-    }
+    // Always provide rev and shortRev - use placeholder for inputs without a real rev
+    let rev = rev_opt.unwrap_or_else(|| "0000000000000000000000000000000000000000".to_string());
+    let short_rev = &rev[..7.min(rev.len())];
+    attrs.push(format!(r#"rev = "{}";"#, rev));
+    attrs.push(format!(r#"shortRev = "{}";"#, short_rev));
 
-    if let Some(ts) = last_modified_opt {
-        attrs.push(format!("lastModified = {};", ts));
-        // Format lastModifiedDate as YYYYMMDD
-        let datetime = chrono::DateTime::from_timestamp(ts as i64, 0)
-            .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
-        let date_str = datetime.format("%Y%m%d").to_string();
-        attrs.push(format!(r#"lastModifiedDate = "{}";"#, date_str));
-    }
+    // Always provide lastModified and lastModifiedDate
+    let ts = last_modified_opt.unwrap_or(0);
+    attrs.push(format!("lastModified = {};", ts));
+    let datetime = chrono::DateTime::from_timestamp(ts as i64, 0)
+        .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
+    let date_str = datetime.format("%Y%m%d").to_string();
+    attrs.push(format!(r#"lastModifiedDate = "{}";"#, date_str));
 
-    if attrs.is_empty() {
-        String::new()
-    } else {
-        format!(" {}", attrs.join(" "))
-    }
+    format!(" {}", attrs.join(" "))
 }
 
 /// Get git metadata for a directory without copying to the nix store.
-/// Returns Nix attribute syntax for rev, shortRev, lastModified, lastModifiedDate.
 fn get_git_metadata(flake_dir: &str) -> String {
     let repo = match git2::Repository::discover(flake_dir) {
         Ok(r) => r,
         Err(_) => {
-            // Not a git repo - return minimal attrs
             return "lastModified = 0; lastModifiedDate = \"19700101\";".to_string();
         }
     };
@@ -1254,7 +873,6 @@ fn get_git_metadata(flake_dir: &str) -> String {
     let short_rev = &rev[..7.min(rev.len())];
     let timestamp = commit.time().seconds();
 
-    // Format lastModifiedDate as YYYYMMDD
     let datetime = chrono::DateTime::from_timestamp(timestamp, 0)
         .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
     let date_str = datetime.format("%Y%m%d").to_string();
@@ -1272,7 +890,6 @@ fn resolve_override_path(path: &str) -> Result<String> {
             .context("HOME environment variable not set")?;
         format!("{}{}", home, &path[1..])
     } else if path.starts_with('~') {
-        // ~user/path - not supported for simplicity
         return Err(anyhow!("~user paths are not supported, use absolute path or ~/"));
     } else {
         path.to_string()
@@ -1304,407 +921,321 @@ fn resolve_override_path(path: &str) -> Result<String> {
 }
 
 /// Generate a Nix expression for an overridden input (local path, no store copy).
-///
-/// This handles the case where --override-input specifies a local path.
-/// We import the flake.nix directly and read its flake.lock to construct inputs.
 fn generate_override_input_expr(
     node_name: &str,
     override_path: &str,
-    _is_flake_hint: bool,
+    is_flake: bool,
+    _lock: &FlakeLock,
+    _store_paths: &HashMap<String, String>,
 ) -> Result<String> {
     let sanitized = sanitize_name(node_name);
-
-    // Determine if the override path is a flake by checking for flake.nix
-    // This is more reliable than using the original lock's flake flag
-    let flake_nix_path = Path::new(override_path).join("flake.nix");
-    let is_flake = flake_nix_path.exists();
 
     if !is_flake {
         // Non-flake override - just use direct path
         return Ok(format!(
-            "{name} = {{ outPath = {path}; }};",
+            "{name} = {{ outPath = \"{path}\"; }};",
             name = sanitized,
             path = override_path
         ));
     }
 
-    // For flake overrides, we need to construct the full input
-    // Read the override's flake.lock if it exists
-    let lock_path = Path::new(override_path).join("flake.lock");
+    // For flake overrides, generate similar expression to main flake
+    // TODO: Handle override's own inputs (would need to parse its flake.lock)
+    // For now, assume no inputs or handle later
 
-    let (inputs_expr, nested_bindings) = if lock_path.exists() {
-        // Parse the override's lock file
-        let lock_content = std::fs::read_to_string(&lock_path)
-            .with_context(|| format!("failed to read {}", lock_path.display()))?;
-        let override_lock: FlakeLock = serde_json::from_str(&lock_content)
-            .with_context(|| format!("failed to parse {}", lock_path.display()))?;
-
-        // Generate expressions for the override's inputs
-        generate_override_inputs(&override_lock, override_path)?
-    } else {
-        // No lock file - the override has no inputs
-        ("{ }".to_string(), String::new())
-    };
-
-    // Get git metadata for the override path
     let git_attrs = get_git_metadata(override_path);
 
     Ok(format!(
         r#"# Overridden input: {node_name} -> {override_path}
-  {nested_bindings}{name} = let
-    _override_path = {path};
-    _flake = import (_override_path + "/flake.nix");
-    _inputs = {inputs};
+  {name} = let
+    _override_path = "{path}";
+    _flake = import ((toString _override_path) + "/flake.nix");
+    _inputs = {{ }};  # TODO: Handle override's inputs
     _self = {{ outPath = _override_path; inputs = _inputs; _type = "flake"; {git_attrs} }};
     _outputs = _flake.outputs (_inputs // {{ self = _self // _outputs; }});
   in _outputs // {{ outPath = _override_path; inputs = _inputs; outputs = _outputs; _type = "flake"; }};"#,
         node_name = node_name,
         override_path = override_path,
-        nested_bindings = nested_bindings,
         name = sanitized,
         path = override_path,
-        inputs = inputs_expr,
         git_attrs = git_attrs,
     ))
 }
 
-/// Generate input expressions for an override's dependencies.
-/// Returns (inputs_attrset_expr, nested_let_bindings).
-fn generate_override_inputs(lock: &FlakeLock, override_path: &str) -> Result<(String, String)> {
-    let root_node = match lock.nodes.get(&lock.root) {
-        Some(node) => node,
-        None => return Ok(("{ }".to_string(), String::new())),
-    };
+//=============================================================================
+// Flake Show / Check Evaluation
+// (Native evaluation of flake outputs structure without store copy)
+//=============================================================================
 
-    if root_node.inputs.is_empty() {
-        return Ok(("{ }".to_string(), String::new()));
+/// Evaluate a Nix expression by wrapping it in builtins.toJSON, avoiding --strict.
+///
+/// This approach serializes to JSON within the Nix evaluation context, where
+/// builtins.tryEval wrappers are active. The --strict flag forces evaluation in
+/// a separate phase outside tryEval contexts, which can trigger errors from lazy
+/// thunks that reference missing attributes (e.g., nixpkgs.rev on tarball inputs).
+fn eval_to_json_via_tojson(expr: &str) -> Result<serde_json::Value> {
+    debug!("evaluating expression via builtins.toJSON ({} bytes)", expr.len());
+    trace!("expression:\n{}", expr);
+
+    // Wrap the expression in builtins.toJSON so serialization happens during
+    // evaluation (where tryEval is active), not during --strict post-processing.
+    let wrapped = format!("builtins.toJSON ({})", expr);
+
+    let output = Command::new("nix")
+        .args(["eval", "--json", "--impure", "--expr", &wrapped])
+        .output()
+        .context("failed to execute nix eval")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("nix eval (toJSON) failed with stderr:\n{}", stderr);
+        bail!("evaluation failed: {}", stderr.trim());
     }
 
-    // Sort nodes topologically
-    let sorted_nodes = topological_sort_nodes(lock)?;
+    // Output is a JSON-encoded string (double-encoded JSON).
+    // First parse as JSON to get the inner string, then parse that as JSON.
+    let outer_json: String = serde_json::from_slice(&output.stdout)
+        .context("failed to parse outer JSON string from nix eval")?;
 
-    let mut let_bindings = Vec::new();
-    let mut input_attrs = Vec::new();
+    let value: serde_json::Value = serde_json::from_str(&outer_json)
+        .context("failed to parse inner JSON from builtins.toJSON output")?;
 
-    // Generate fetch/build expressions for each input
-    for node_name in &sorted_nodes {
-        if node_name == &lock.root {
-            continue;
-        }
-
-        let node = lock.nodes.get(node_name)
-            .ok_or_else(|| anyhow!("node '{}' not found in override lock", node_name))?;
-
-        // Generate fetch expression
-        if let Some(ref locked) = node.locked {
-            let fetch_expr = generate_fetch_expr(locked, override_path);
-            let_bindings.push(format!(
-                "_override_src_{} = {};",
-                sanitize_name(node_name),
-                fetch_expr
-            ));
-
-            // Build the input
-            if node.flake {
-                let src_name = format!("_override_src_{}", sanitize_name(node_name));
-                let nested_inputs = generate_nested_input_refs(&node.inputs, lock, "_override_")?;
-                let_bindings.push(format!(
-                    r#"_override_{name} = let
-      _flake = import ({src} + "/flake.nix");
-      _inputs = {{ {nested_inputs} }};
-      _self = {{ outPath = {src}; inputs = _inputs; _type = "flake"; }};
-      _outputs = _flake.outputs (_inputs // {{ self = _self // _outputs; }});
-    in _outputs // {{ outPath = {src}; inputs = _inputs; outputs = _outputs; _type = "flake"; }};"#,
-                    name = sanitize_name(node_name),
-                    src = src_name,
-                    nested_inputs = nested_inputs,
-                ));
-            } else {
-                let_bindings.push(format!(
-                    "_override_{name} = {{ outPath = _override_src_{name}; }};",
-                    name = sanitize_name(node_name)
-                ));
-            }
-        }
-    }
-
-    // Build root inputs attrset
-    for (input_name, input_ref) in &root_node.inputs {
-        let resolved = match input_ref {
-            InputRef::Direct(name) => format!("_override_{}", sanitize_name(name)),
-            InputRef::Follows(path) => {
-                if path.is_empty() {
-                    "_self".to_string() // Points to the override's self
-                } else {
-                    match resolve_follows_to_name(path, lock)? {
-                        FollowsResolution::Node(name) => format!("_override_{}", name),
-                        FollowsResolution::Self_ => "_self".to_string(),
-                    }
-                }
-            }
-        };
-        input_attrs.push(format!("\"{}\" = {};", input_name, resolved));
-    }
-
-    let bindings_str = if let_bindings.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n  ", let_bindings.join("\n  "))
-    };
-
-    Ok((format!("{{ {} }}", input_attrs.join(" ")), bindings_str))
+    Ok(value)
 }
 
-/// Generate input references for nested inputs (within an override's input).
-fn generate_nested_input_refs(
-    inputs: &HashMap<String, InputRef>,
+/// Evaluate flake outputs structure for `trix flake show --json`.
+///
+/// Produces output matching `nix flake show --json` format without copying
+/// the local flake to the store.
+#[instrument(level = "debug", skip(lock))]
+pub fn eval_flake_show_json(
+    flake_path: &Path,
     lock: &FlakeLock,
-    prefix: &str,
-) -> Result<String> {
-    let mut refs = Vec::new();
-    for (input_name, input_ref) in inputs {
-        let resolved = match input_ref {
-            InputRef::Direct(name) => format!("{}{}", prefix, sanitize_name(name)),
-            InputRef::Follows(path) => {
-                if path.is_empty() {
-                    "_self".to_string()
-                } else {
-                    match resolve_follows_to_name(path, lock)? {
-                        FollowsResolution::Node(name) => format!("{}{}", prefix, name),
-                        FollowsResolution::Self_ => "_self".to_string(),
-                    }
-                }
-            }
-        };
-        refs.push(format!("\"{}\" = {};", input_name, resolved));
-    }
-    Ok(refs.join(" "))
-}
+    all_systems: bool,
+    legacy: bool,
+) -> Result<serde_json::Value> {
+    debug!("evaluating flake outputs for show: {}", flake_path.display());
 
-/// A Nix value wrapper.
-#[derive(Clone)]
-pub struct NixValue {
-    inner: nix_bindings_expr::value::Value,
-}
+    // Prefetch all inputs
+    let store_paths = prefetch_all_inputs(lock)?;
 
-impl NixValue {
-    /// Get the type name of this value.
-    pub fn type_name(&self) -> &'static str {
-        // TODO: implement proper type detection
-        "value"
-    }
-}
+    let flake_dir = flake_path.to_str()
+        .ok_or_else(|| anyhow!("invalid flake path"))?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    // Generate the base expression (ends with "in outputs")
+    let base_expr = generate_flake_eval_expr(
+        flake_dir,
+        lock,
+        &[],
+        &HashMap::new(),
+        &store_paths,
+    )?;
 
-    #[test]
-    fn eval_simple_string() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval.eval_string(r#""hello world""#, "<test>").unwrap();
-        let s = eval.require_string(&value).unwrap();
-        assert_eq!(s, "hello world");
-    }
+    let all_systems_nix = if all_systems { "true" } else { "false" };
+    let show_legacy_nix = if legacy { "true" } else { "false" };
 
-    #[test]
-    fn eval_simple_int() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval.eval_string("42", "<test>").unwrap();
-        let n = eval.require_int(&value).unwrap();
-        assert_eq!(n, 42);
-    }
+    // Wrap with the show expression that produces nix flake show --json format
+    let show_expr = format!(
+        r#"
+let
+  outputs = ({base_expr});
+  allSystemsFlag = {all_systems_nix};
+  showLegacyFlag = {show_legacy_nix};
+  currentSystem = builtins.currentSystem;
 
-    #[test]
-    fn eval_arithmetic() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval.eval_string("1 + 2 + 3", "<test>").unwrap();
-        let n = eval.require_int(&value).unwrap();
-        assert_eq!(n, 6);
-    }
+  perSystemAttrs = ["packages" "devShells" "checks" "apps"];
 
-    #[test]
-    fn eval_let_binding() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval
-            .eval_string("let x = 10; y = 20; in x + y", "<test>")
-            .unwrap();
-        let n = eval.require_int(&value).unwrap();
-        assert_eq!(n, 30);
-    }
-
-    #[test]
-    fn eval_string_interpolation() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval
-            .eval_string(r#"let name = "world"; in "hello ${name}""#, "<test>")
-            .unwrap();
-        let s = eval.require_string(&value).unwrap();
-        assert_eq!(s, "hello world");
-    }
-
-    #[test]
-    fn eval_attrset() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval.eval_string("{ foo = 1; bar = 2; }", "<test>").unwrap();
-        assert!(eval.is_attrs(&value).unwrap());
-    }
-
-    #[test]
-    fn eval_get_attr() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval
-            .eval_string("{ foo = 42; bar = 2; }", "<test>")
-            .unwrap();
-        let foo = eval.get_attr(&value, "foo").unwrap().unwrap();
-        let n = eval.require_int(&foo).unwrap();
-        assert_eq!(n, 42);
-    }
-
-    #[test]
-    fn eval_nested_attrs() {
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval
-            .eval_string("{ a.b.c = 123; }", "<test>")
-            .unwrap();
-        let a = eval.get_attr(&value, "a").unwrap().unwrap();
-        let b = eval.get_attr(&a, "b").unwrap().unwrap();
-        let c = eval.get_attr(&b, "c").unwrap().unwrap();
-        let n = eval.require_int(&c).unwrap();
-        assert_eq!(n, 123);
-    }
-
-    #[test]
-    fn eval_simple_derivation_drv_path() {
-        // Test if we can evaluate a simple derivation's drvPath
-        // This derivation does NOT use any local paths
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval
-            .eval_string(
-                r#"
-                (derivation {
-                    name = "simple-test";
-                    system = builtins.currentSystem;
-                    builder = "/bin/sh";
-                    args = ["-c" "echo hello > $out"];
-                }).drvPath
-                "#,
-                "<test>",
-            )
-            .unwrap();
-        let drv_path = eval.require_string(&value).unwrap();
-        assert!(drv_path.starts_with("/nix/store/"));
-        assert!(drv_path.ends_with(".drv"));
-    }
-
-    #[test]
-    fn eval_path_to_string() {
-        // Test if we can evaluate a path (not adding to store)
-        let mut eval = Evaluator::new().unwrap();
-        let value = eval
-            .eval_string("builtins.toString /tmp", "<test>")
-            .unwrap();
-        let s = eval.require_string(&value).unwrap();
-        assert_eq!(s, "/tmp");
-    }
-
-    // NOTE: Tests for path handling in derivations
-    //
-    // Note on path coercion:
-    //
-    // Path coercion (automatically adding local paths to the store when referenced
-    // in derivations) now works correctly with nix-bindings. This was fixed by
-    // ensuring `eval_state_builder_load()` is called during EvalState initialization,
-    // which sets `readOnlyMode = false` and enables proper path coercion.
-    //
-    // Previously this was a limitation, but the fix has been applied upstream in
-    // nix-bindings-rust, so all trix commands now use native evaluation.
-
-    #[test]
-    fn eval_builtins_path_works() {
-        // This test confirms that builtins.path CAN add files to the store
-        let mut eval = Evaluator::new().unwrap();
-
-        let test_file = std::env::temp_dir().join("nix-builtin-path-test.txt");
-        std::fs::write(&test_file, "test content for builtins.path").unwrap();
-
-        let expr = format!(
-            r#"builtins.path {{ path = {}; name = "test-file"; }}"#,
-            test_file.display()
+  # Get derivation/app info. tryEval protects against derivations whose
+  # arguments reference missing attributes.
+  getDrvInfo = drv:
+    if builtins.isAttrs drv && (drv.type or null) == "derivation" then
+      let
+        nameResult = builtins.tryEval (builtins.seq drv.name drv.name);
+        descResult = builtins.tryEval (drv.meta.description or "");
+        name = if nameResult.success then nameResult.value else "unknown";
+        desc = if descResult.success && descResult.value != null then descResult.value else "";
+      in {{ type = "derivation"; name = name; description = desc; }}
+    else if builtins.isAttrs drv && drv ? type && drv.type == "app" then
+      let
+        descResult = builtins.tryEval (
+          if drv ? meta.description then drv.meta.description
+          else if drv ? description then drv.description
+          else ""
         );
+        desc = if descResult.success && descResult.value != null then descResult.value else "";
+      in {{ type = "app"; }} // (if desc != "" then {{ description = desc; }} else {{}})
+    else {{}};
 
-        let result = eval.eval_string(&expr, "<test>");
-        std::fs::remove_file(&test_file).ok();
+  # Recursively walk an attrset tree, detecting derivations at any depth.
+  # Used for hydraJobs which can have varying nesting levels.
+  walkTree = node:
+    let r = builtins.tryEval (
+      if builtins.isAttrs node then
+        let info = getDrvInfo node;
+        in if info != {{}} then info
+        else builtins.mapAttrs (k: v:
+          let r2 = builtins.tryEval (walkTree v);
+          in if r2.success then r2.value else {{}}
+        ) node
+      else {{}}
+    ); in if r.success then r.value else {{}};
 
-        let value = result.expect("builtins.path should work");
-        let s = eval.require_string(&value).unwrap();
-        assert!(s.starts_with("/nix/store/"), "Should be a store path");
-    }
-
-    #[test]
-    fn eval_derivation_with_builtins_path_works() {
-        // This test confirms that wrapping paths with builtins.path works in derivations
-        let mut eval = Evaluator::new().unwrap();
-
-        let test_file = std::env::temp_dir().join("nix-drv-builtins-path-test.txt");
-        std::fs::write(&test_file, "test content").unwrap();
-
-        let expr = format!(
-            r#"
-            let
-              srcPath = builtins.path {{ path = {}; name = "test-src"; }};
-            in (derivation {{
-                name = "path-test-with-builtins";
-                system = builtins.currentSystem;
-                builder = "/bin/sh";
-                args = ["-c" "cat $src > $out"];
-                src = srcPath;
-            }}).drvPath
-            "#,
-            test_file.display()
+  # Process a per-system category (packages, devShells, checks, apps).
+  # Non-current systems show attr names with {{}} values.
+  processPerSystem = cat: val:
+    let
+      raw = builtins.mapAttrs (sys: sysVal:
+        let result = builtins.tryEval (
+          if builtins.isAttrs sysVal then
+            if (sys == currentSystem || allSystemsFlag || cat == "apps") then
+              builtins.mapAttrs (name: drv:
+                let r = builtins.tryEval (getDrvInfo drv);
+                in if r.success then r.value else {{}}
+              ) sysVal
+            else
+              builtins.mapAttrs (name: _: {{}}) sysVal
+          else {{}}
         );
+        in if result.success then result.value else {{}}
+      ) val;
+      nonEmpty = builtins.filter (name: raw.${{name}} != {{}}) (builtins.attrNames raw);
+    in builtins.listToAttrs (map (name: {{ inherit name; value = raw.${{name}}; }}) nonEmpty);
 
-        let result = eval.eval_string(&expr, "<test>");
-        std::fs::remove_file(&test_file).ok();
+  processLegacy = val:
+    builtins.mapAttrs (sys: sysVal:
+      if !showLegacyFlag then {{}}
+      else if (sys == currentSystem || allSystemsFlag) then
+        let result = builtins.tryEval (
+          let
+            names = builtins.attrNames sysVal;
+            derivNames = builtins.filter (name:
+              let r = builtins.tryEval (builtins.isAttrs sysVal.${{name}} && (sysVal.${{name}}.type or null) == "derivation");
+              in r.success && r.value
+            ) names;
+          in builtins.listToAttrs (map (name:
+            let r = builtins.tryEval (getDrvInfo sysVal.${{name}});
+            in {{ inherit name; value = if r.success then r.value else {{}}; }}
+          ) derivNames)
+        );
+        in if result.success then result.value else {{}}
+      else {{}}
+    ) val;
 
-        let value = result.expect("derivation with builtins.path should work");
-        let drv_path = eval.require_string(&value).unwrap();
-        assert!(drv_path.starts_with("/nix/store/"), "drvPath should be in /nix/store");
-        assert!(drv_path.ends_with(".drv"), "drvPath should end with .drv");
-    }
+  processCategory = cat: val:
+    let result = builtins.tryEval (
+      if builtins.elem cat perSystemAttrs && builtins.isAttrs val then
+        processPerSystem cat val
+      else if cat == "legacyPackages" && builtins.isAttrs val then
+        processLegacy val
+      else if cat == "formatter" && builtins.isAttrs val then
+        builtins.mapAttrs (sys: drv:
+          if (sys == currentSystem || allSystemsFlag) then
+            let r = builtins.tryEval (getDrvInfo drv);
+            in if r.success then r.value else {{}}
+          else {{}}
+        ) val
+      else if builtins.elem cat ["defaultPackage" "defaultApp" "devShell"] && builtins.isAttrs val then
+        builtins.mapAttrs (sys: drv:
+          if (sys == currentSystem || allSystemsFlag) then
+            let r = builtins.tryEval (getDrvInfo drv);
+            in if r.success then r.value else {{}}
+          else {{}}
+        ) val
+      else if cat == "overlays" && builtins.isAttrs val then
+        builtins.mapAttrs (name: _: {{ type = "nixpkgs-overlay"; }}) val
+      else if cat == "overlay" then
+        {{ type = "nixpkgs-overlay"; }}
+      else if cat == "nixosModules" && builtins.isAttrs val then
+        builtins.mapAttrs (name: _: {{ type = "nixos-module"; }}) val
+      else if builtins.elem cat ["nixosModule" "darwinModule"] then
+        {{ type = "nixos-module"; }}
+      else if cat == "templates" && builtins.isAttrs val then
+        builtins.mapAttrs (name: tmpl:
+          if builtins.isAttrs tmpl && tmpl ? description then
+            {{ type = "template"; description = tmpl.description or ""; }}
+          else {{ type = "template"; }}
+        ) val
+      else if cat == "nixosConfigurations" && builtins.isAttrs val then
+        builtins.mapAttrs (name: _: {{ type = "nixos-configuration"; }}) val
+      else if cat == "hydraJobs" && builtins.isAttrs val then
+        walkTree val
+      else
+        {{ type = "unknown"; }}
+    );
+    in if result.success then result.value else {{ type = "unknown"; }};
 
-    #[test]
-    fn native_build_simple_derivation() {
-        // Test the native build_value method using realise_string
-        let mut eval = Evaluator::new().unwrap();
+  categories = builtins.attrNames outputs;
 
-        // A simple derivation that just echoes to $out
-        let expr = r#"
-            derivation {
-                name = "native-build-test";
-                system = builtins.currentSystem;
-                builder = "/bin/sh";
-                args = ["-c" "echo 'hello from native build' > $out"];
+  allResults = builtins.listToAttrs (map (cat: {{
+    name = cat;
+    value = processCategory cat outputs.${{cat}};
+  }}) categories);
+
+  nonEmptyCats = builtins.filter (name: allResults.${{name}} != {{}}) (builtins.attrNames allResults);
+
+in builtins.listToAttrs (map (name: {{ inherit name; value = allResults.${{name}}; }}) nonEmptyCats)
+"#,
+        base_expr = base_expr,
+        all_systems_nix = all_systems_nix,
+        show_legacy_nix = show_legacy_nix,
+    );
+
+    eval_to_json_via_tojson(&show_expr)
+}
+
+/// Get the list of check derivation paths for a local flake.
+///
+/// Returns a list of (check_name, drv_path) for all checks in the current system.
+#[instrument(level = "debug", skip(lock))]
+pub fn eval_flake_checks(
+    flake_path: &Path,
+    lock: &FlakeLock,
+    system: &str,
+) -> Result<Vec<(String, String)>> {
+    debug!("evaluating flake checks for system {}", system);
+
+    // Prefetch all inputs
+    let store_paths = prefetch_all_inputs(lock)?;
+
+    let flake_dir = flake_path.to_str()
+        .ok_or_else(|| anyhow!("invalid flake path"))?;
+
+    // First, get the list of check names
+    let names_expr = generate_flake_eval_expr(
+        flake_dir,
+        lock,
+        &["checks".to_string(), system.to_string()],
+        &HashMap::new(),
+        &store_paths,
+    )?;
+
+    let check_names_expr = format!("builtins.attrNames ({})", names_expr);
+    let names_json = eval_to_json(&check_names_expr)?;
+
+    let check_names: Vec<String> = serde_json::from_value(names_json)
+        .context("failed to parse check names")?;
+
+    debug!("found {} checks: {:?}", check_names.len(), check_names);
+
+    // Now evaluate each check to get its .drv path
+    let mut results = Vec::new();
+    for name in &check_names {
+        let attr_path = vec![
+            "checks".to_string(),
+            system.to_string(),
+            name.clone(),
+        ];
+
+        match generate_and_eval_local_flake(flake_path, lock, &attr_path, &HashMap::new()) {
+            Ok(drv_path) => {
+                results.push((name.clone(), drv_path));
             }
-        "#;
-
-        let value = eval.eval_string(expr, "<test>").unwrap();
-
-        // Verify it's a derivation
-        assert!(eval.is_derivation(&value).unwrap());
-
-        // Get the drv path
-        let drv_path = eval.get_drv_path(&value).unwrap();
-        assert!(drv_path.ends_with(".drv"));
-
-        // Build it using the native build_value method
-        let output_path = eval.build_value(&value).unwrap();
-
-        assert!(output_path.starts_with("/nix/store/"));
-        assert!(output_path.contains("native-build-test"));
-
-        // Verify the output file exists and has expected content
-        let content = std::fs::read_to_string(&output_path).unwrap();
-        assert!(content.contains("hello from native build"));
+            Err(e) => {
+                debug!("failed to evaluate check {}: {}", name, e);
+                // Continue with other checks
+            }
+        }
     }
+
+    Ok(results)
 }

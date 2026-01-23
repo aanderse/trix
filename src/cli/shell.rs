@@ -9,8 +9,9 @@ use clap::Args;
 use tracing::{debug, info, instrument, trace};
 
 use crate::cli::build::parse_override_inputs;
-use crate::eval::Evaluator;
+use crate::eval;
 use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
+use crate::lock;
 use crate::progress;
 
 #[derive(Args)]
@@ -52,10 +53,9 @@ pub fn run(args: ShellArgs) -> Result<()> {
         return run_remote(&args);
     }
 
-    // All local - use native evaluation
+    // All local - use new evaluator
     let system = current_system()?;
     let mut store_paths = Vec::new();
-    let mut eval = Evaluator::new().context("failed to initialize evaluator")?;
 
     // Parse override inputs
     let input_overrides = parse_override_inputs(&args.override_input);
@@ -69,27 +69,32 @@ pub fn run(args: ShellArgs) -> Result<()> {
 
         let resolved = resolve_installable_any(installable, &cwd);
         let flake_path = resolved.path.expect("local flake should have path");
+
+        // Read flake.lock (missing lock is OK for flakes with no inputs)
+        let lock = lock::read_flake_lock(&flake_path).unwrap_or_else(|_| lock::FlakeLock::empty());
+
         let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
         debug!(?candidates, "expanded attribute candidates");
 
         // Try each candidate until one succeeds
-        let (attr_path, value) = {
+        let (_attr_path, drv_path) = {
             let mut found = None;
 
             for candidate in &candidates {
                 let eval_target = format!("{}#{}", flake_path.display(), candidate.join("."));
                 trace!("trying {}", eval_target);
 
-                let result = if input_overrides.is_empty() {
-                    eval.eval_flake_attr(&flake_path, candidate)
-                } else {
-                    eval.eval_flake_attr_with_overrides(&flake_path, candidate, &input_overrides)
-                };
+                let result = eval::generate_and_eval_local_flake(
+                    &flake_path,
+                    &lock,
+                    candidate,
+                    &input_overrides,
+                );
 
                 match result {
-                    Ok(value) => {
+                    Ok(drv) => {
                         info!("evaluating {}", eval_target);
-                        found = Some((candidate.clone(), value));
+                        found = Some((candidate.clone(), drv));
                         break;
                     }
                     Err(e) => {
@@ -109,16 +114,13 @@ pub fn run(args: ShellArgs) -> Result<()> {
             })?
         };
 
-        debug!(attr = %attr_path.join("."), "found attribute");
-
-        let drv_path = eval.get_drv_path(&value)?;
         debug!(drv = %drv_path, "got derivation path");
 
         // Build it
         info!("building {}", drv_path);
         let build_status = progress::building(&drv_path);
 
-        let store_path = eval.build_value(&value)?;
+        let store_path = eval::build_drv(&drv_path)?;
 
         build_status.finish_and_clear();
         store_paths.push(store_path);
@@ -186,6 +188,7 @@ fn run_remote(args: &ShellArgs) -> Result<()> {
     );
 
     let mut cmd = Command::new("nix");
+    cmd.args(["--extra-experimental-features", "nix-command flakes"]);
     cmd.arg("shell");
 
     // Add all installables

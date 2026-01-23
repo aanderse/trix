@@ -489,8 +489,12 @@ fn create_test_flake_with_binary(dir: &Path, package_name: &str, binary_name: &s
     let _ = Command::new("git")
         .args(["-C", dir_str, "commit", "-m", "init", "--quiet"])
         .output();
-    // Generate lock file
-    let _ = Command::new("nix")
+    // Generate lock file using trix (never copies local flake to store)
+    let trix = std::env::var("CARGO_BIN_EXE_trix").unwrap_or_else(|_| {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        format!("{}/target/debug/trix", manifest_dir)
+    });
+    let _ = Command::new(&trix)
         .args(["flake", "lock", dir_str])
         .output();
     let _ = Command::new("git")

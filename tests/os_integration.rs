@@ -314,9 +314,10 @@ fn os_rebuild_expr_uses_local_path_directly() {
     let flake_path = temp_dir.path().display().to_string();
 
     // Verify the expression references the local path directly (not a store path)
+    // Path should be quoted as a string to prevent store copy
     assert!(
-        expr.contains(&format!("flakeDirPath = {}", flake_path)),
-        "Expression should reference local path directly.\nExpected: flakeDirPath = {}\nGot:\n{}",
+        expr.contains(&format!("flakeDirPath = \"{}\"", flake_path)),
+        "Expression should reference local path directly as a quoted string.\nExpected: flakeDirPath = \"{}\"\nGot:\n{}",
         flake_path,
         expr.lines()
             .filter(|l| l.contains("flakeDirPath"))
@@ -341,15 +342,16 @@ fn os_rebuild_expr_fetches_remote_inputs() {
 
     let expr = result.unwrap();
 
-    // Verify nixpkgs is fetched via builtins.fetchTree (respects access-tokens for private repos)
+    // Verify nixpkgs is prefetched to a store path
+    // We use `nix flake prefetch` which respects access-tokens for private repos
     assert!(
-        expr.contains("builtins.fetchTree"),
-        "Expression should fetch remote inputs via builtins.fetchTree"
-    );
-
-    assert!(
-        expr.contains("nixpkgs") || expr.contains("NixOS/nixpkgs"),
-        "Expression should reference nixpkgs input"
+        expr.contains("/nix/store/") && expr.contains("nixpkgs"),
+        "Expression should reference prefetched nixpkgs from store.\nGot:\n{}",
+        expr.lines()
+            .filter(|l| l.contains("nixpkgs") || l.contains("/nix/store/"))
+            .take(10)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 

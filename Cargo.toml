@@ -62,13 +62,6 @@ tempfile = "3"
 # Directory traversal
 walkdir = "2"
 
-# Nix bindings for native evaluation
-nix-bindings-util = "0.2"
-nix-bindings-store = "0.2"
-nix-bindings-expr = "0.2"
-nix-bindings-flake = "0.2"
-nix-bindings-fetchers = "0.2"
-
 [dev-dependencies]
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }

@@ -31,7 +31,6 @@ fn trix_build(args: &[&str]) -> Result<String, String> {
 // Local Flake Tests (current directory - trix itself)
 // =============================================================================
 // Tests that build trix itself (via .#default)
-// These require nix-bindings-rust to be available as a flake input.
 
 #[test]
 fn build_local_default() {

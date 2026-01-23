@@ -11,7 +11,7 @@ use clap::Args;
 use tracing::{debug, info};
 use walkdir::WalkDir;
 
-use crate::eval::Evaluator;
+// No longer need Evaluator - using nix eval subprocess
 
 #[derive(Args)]
 pub struct InitArgs {
@@ -81,22 +81,23 @@ pub fn run_template_copy(target_dir: &Path, template_ref: &str, is_new: bool) ->
 
     debug!(attr = %template_attr.join("."), "evaluating template");
 
-    // Evaluate the template using our evaluator
-    // eval_flake_outputs handles lock file reading internally
-    let mut evaluator = Evaluator::new().context("failed to initialize Nix evaluator")?;
-    let outputs = evaluator.eval_flake_outputs(flake_path)?;
+    // Evaluate the template path using nix eval
+    let template_path_expr = format!("{}#{}.path", flake_store_path, template_attr.join("."));
+    let path_output = Command::new("nix")
+        .args(["eval", "--raw", &template_path_expr])
+        .output()
+        .context("failed to run nix eval for template path")?;
 
-    // Navigate to the template
-    let template = evaluator.navigate_attr_path(outputs, &template_attr)
-        .context(format!("template '{}' not found", template_name))?;
+    if !path_output.status.success() {
+        let stderr = String::from_utf8_lossy(&path_output.stderr);
+        return Err(anyhow!(
+            "template '{}' not found: {}",
+            template_name,
+            stderr.trim()
+        ));
+    }
 
-    // Get the template path
-    let path_value = evaluator.get_attr(&template, "path")?
-        .ok_or_else(|| anyhow!("template does not have a 'path' attribute"))?;
-
-    let template_path_str = evaluator.coerce_to_string(&path_value)
-        .context("failed to get template path")?;
-
+    let template_path_str = String::from_utf8_lossy(&path_output.stdout).to_string();
     let template_path = Path::new(&template_path_str);
 
     debug!(template_path = %template_path_str, "got template path");
@@ -105,12 +106,37 @@ pub fn run_template_copy(target_dir: &Path, template_ref: &str, is_new: bool) ->
         return Err(anyhow!("template path does not exist: {}", template_path_str));
     }
 
-    // Get optional description and welcomeText
-    let description = evaluator.get_attr(&template, "description")?
-        .and_then(|v| evaluator.require_string(&v).ok());
+    // Get optional description using nix eval
+    let desc_expr = format!("{}#{}.description or null", flake_store_path, template_attr.join("."));
+    let description = Command::new("nix")
+        .args(["eval", "--raw", &desc_expr])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            if s.is_empty() || s == "null" {
+                None
+            } else {
+                Some(s)
+            }
+        });
 
-    let welcome_text = evaluator.get_attr(&template, "welcomeText")?
-        .and_then(|v| evaluator.require_string(&v).ok());
+    // Get optional welcomeText using nix eval
+    let welcome_expr = format!("{}#{}.welcomeText or null", flake_store_path, template_attr.join("."));
+    let welcome_text = Command::new("nix")
+        .args(["eval", "--raw", &welcome_expr])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            if s.is_empty() || s == "null" {
+                None
+            } else {
+                Some(s)
+            }
+        });
 
     if let Some(ref desc) = description {
         debug!(description = %desc, "template description");

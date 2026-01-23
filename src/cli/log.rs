@@ -8,8 +8,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Args;
 use tracing::{debug, instrument, trace};
 
-use crate::eval::generate_flake_eval_expr;
+use crate::eval;
 use crate::flake::{current_system, expand_attribute, format_attribute_not_found_error, resolve_installable_any, OperationContext};
+use crate::lock;
 
 #[derive(Args)]
 pub struct LogArgs {
@@ -45,32 +46,13 @@ pub fn run(args: LogArgs) -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("local flake must have path"))?;
 
-    // For flakes without a lock, pass through to nix log
-    if resolved.lock.is_none() {
-        debug!("passing through to nix log for flake without lock");
-        let installable_str = resolved.to_installable_string();
-        let status = Command::new("nix")
-            .args(["log", &installable_str])
-            .status()
-            .context("failed to run nix log")?;
+    // Read flake.lock (missing lock is OK for flakes with no inputs)
+    let flake_lock = lock::read_flake_lock(flake_path)
+        .unwrap_or_else(|_| lock::FlakeLock::empty());
 
-        if !status.success() {
-            return Err(anyhow!("nix log failed"));
-        }
-        return Ok(());
-    }
-
-    // For local flakes with lock, get the derivation path and show its log
-    let lock = resolved.lock.as_ref().unwrap();
     let system = current_system()?;
-
-    // Expand the attribute path and try each candidate
     let candidates = expand_attribute(&resolved.attribute, OperationContext::Build, &system);
     debug!(?candidates, "expanded attribute candidates");
-
-    let flake_dir = flake_path
-        .to_str()
-        .ok_or_else(|| anyhow!("invalid flake path"))?;
 
     // Try each candidate until one succeeds
     let drv_path = {
@@ -79,31 +61,23 @@ pub fn run(args: LogArgs) -> Result<()> {
         for candidate in &candidates {
             trace!("trying candidate: {}", candidate.join("."));
 
-            let expr = match generate_flake_eval_expr(flake_dir, lock, candidate, &HashMap::new()) {
-                Ok(e) => e,
-                Err(e) => {
-                    trace!("candidate {} failed to generate expr: {}", candidate.join("."), e);
-                    continue;
+            match eval::generate_and_eval_local_flake(
+                flake_path,
+                &flake_lock,
+                candidate,
+                &HashMap::new(),
+            ) {
+                Ok(drv) => {
+                    debug!(attr = %candidate.join("."), drv = %drv, "found derivation");
+                    found = Some(drv);
+                    break;
                 }
-            };
-
-            let output = Command::new("nix-instantiate")
-                .args(["-E", &expr])
-                .output()
-                .context("failed to run nix-instantiate")?;
-
-            if output.status.success() {
-                let drv = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                debug!(attr = %candidate.join("."), drv = %drv, "found derivation");
-                found = Some(drv);
-                break;
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                trace!("candidate {} failed: {}", candidate.join("."), stderr.trim());
+                Err(e) => {
+                    trace!("candidate {} failed: {}", candidate.join("."), e);
+                }
             }
         }
 
-        // Build flake URL for error message
         let canonical = flake_path
             .canonicalize()
             .unwrap_or_else(|_| flake_path.clone());
@@ -114,15 +88,18 @@ pub fn run(args: LogArgs) -> Result<()> {
         })?
     };
 
-    // Use nix log to show the build log
-    let status = Command::new("nix")
+    // Use nix log to show the build log (no store copy)
+    let output = Command::new("nix")
         .args(["log", &drv_path])
-        .status()
+        .output()
         .context("failed to run nix log")?;
 
-    if !status.success() {
+    if !output.status.success() {
         return Err(anyhow!("no build log available for {}", drv_path));
     }
+
+    let log_content = String::from_utf8_lossy(&output.stdout);
+    print!("{}", log_content);
 
     Ok(())
 }

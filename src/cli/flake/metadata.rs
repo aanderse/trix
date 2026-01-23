@@ -12,7 +12,6 @@ use owo_colors::{OwoColorize, Stream::Stdout};
 use serde_json::json;
 use tracing::{debug, instrument};
 
-use crate::eval::Evaluator;
 use crate::flake::resolve_installable;
 use crate::lock::{FlakeLock, InputRef, LockedRef};
 
@@ -122,23 +121,27 @@ fn extract_local_metadata(flake_path: &std::path::Path) -> Result<serde_json::Va
     Ok(metadata)
 }
 
-/// Extract description from flake.nix using the evaluator
+/// Extract description from flake.nix using nix eval
 fn extract_description(flake_path: &str) -> Result<Option<String>> {
-    let mut evaluator = Evaluator::new().context("failed to initialize Nix evaluator")?;
-
     let expr = format!(
         r#"(import {}/flake.nix).description or null"#,
         flake_path
     );
 
-    match evaluator.eval_string(&expr, "<trix metadata>") {
-        Ok(value) => {
-            match evaluator.require_string(&value) {
-                Ok(s) if !s.is_empty() && s != "null" => Ok(Some(s)),
-                _ => Ok(None),
+    let output = Command::new("nix")
+        .args(["eval", "--raw", "--impure", "--expr", &expr])
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let s = String::from_utf8_lossy(&output.stdout).to_string();
+            if s.is_empty() || s == "null" {
+                Ok(None)
+            } else {
+                Ok(Some(s))
             }
         }
-        Err(_) => Ok(None),
+        _ => Ok(None),
     }
 }
 
