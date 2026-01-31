@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{anyhow, Context, Result};
@@ -14,6 +15,19 @@ use tracing::{debug, instrument};
 
 use crate::flake::resolve_installable;
 use crate::lock::{FlakeLock, InputRef, LockedRef};
+
+/// Information about a git repository state.
+#[derive(Debug)]
+struct GitInfo {
+    /// The HEAD commit hash.
+    rev: String,
+    /// Short version of the commit hash.
+    short_rev: String,
+    /// Whether the working tree has uncommitted changes.
+    is_dirty: bool,
+    /// Commit timestamp.
+    last_modified: Option<u64>,
+}
 
 #[derive(Args)]
 pub struct MetadataArgs {
@@ -76,49 +90,177 @@ fn extract_local_metadata(flake_path: &std::path::Path) -> Result<serde_json::Va
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
 
-    // Build locked info for local path
-    let locked = json!({
-        "type": "path",
-        "path": flake_path_str,
-    });
+    // Check if we're in a git repository
+    let git_info = get_git_info(flake_path);
 
-    let original = json!({
-        "type": "path",
-        "path": flake_path_str,
-    });
+    // Build locked/original info based on whether this is a git repo
+    let (locked, original, original_url, resolved_url, effective_last_modified) = if let Some(ref git) = git_info {
+        let git_url = format!("file://{}", flake_path_str);
+        let git_last_modified = git.last_modified.or(last_modified);
 
-    // Load locks from flake.lock if present
+        if git.is_dirty {
+            // Dirty git repo
+            let dirty_rev = format!("{}-dirty", git.rev);
+            let dirty_short_rev = format!("{}-dirty", git.short_rev);
+
+            let locked = json!({
+                "__final": true,
+                "dirtyRev": dirty_rev,
+                "dirtyShortRev": dirty_short_rev,
+                "lastModified": git_last_modified,
+                "type": "git",
+                "url": git_url,
+            });
+
+            let original = json!({
+                "type": "git",
+                "url": git_url,
+            });
+
+            (
+                locked,
+                original,
+                format!("git+file://{}", flake_path_str),
+                format!("git+file://{}", flake_path_str),
+                git_last_modified,
+            )
+        } else {
+            // Clean git repo
+            let locked = json!({
+                "__final": true,
+                "lastModified": git_last_modified,
+                "rev": git.rev,
+                "shortRev": git.short_rev,
+                "type": "git",
+                "url": git_url,
+            });
+
+            let original = json!({
+                "type": "git",
+                "url": git_url,
+            });
+
+            (
+                locked,
+                original,
+                format!("git+file://{}", flake_path_str),
+                format!("git+file://{}", flake_path_str),
+                git_last_modified,
+            )
+        }
+    } else {
+        // Not a git repo, use path type
+        let locked = json!({
+            "type": "path",
+            "path": flake_path_str,
+        });
+
+        let original = json!({
+            "type": "path",
+            "path": flake_path_str,
+        });
+
+        (
+            locked,
+            original.clone(),
+            format!("path:{}", flake_path_str),
+            format!("path:{}", flake_path_str),
+            last_modified,
+        )
+    };
+
+    // Load locks from flake.lock if present, otherwise use empty locks structure
     let locks = if flake_lock.exists() {
         let content = fs::read_to_string(&flake_lock)
             .context("failed to read flake.lock")?;
-        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+        serde_json::from_str(&content).unwrap_or_else(|_| json!({
+            "nodes": { "root": {} },
+            "root": "root",
+            "version": 7
+        }))
     } else {
-        json!({})
+        // Default empty locks structure matching nix output
+        json!({
+            "nodes": { "root": {} },
+            "root": "root",
+            "version": 7
+        })
     };
 
     // Build the metadata object
     let mut metadata = json!({
         "locked": locked,
-        "original": original,
-        "originalUrl": format!("path:{}", flake_path_str),
+        "original": original.clone(),
+        "originalUrl": original_url,
         "path": flake_path_str,
-        "resolved": original.clone(),
-        "resolvedUrl": format!("path:{}", flake_path_str),
+        "resolved": original,
+        "resolvedUrl": resolved_url,
     });
+
+    // Add dirtyRevision at top level for dirty git repos
+    if let Some(ref git) = git_info {
+        if git.is_dirty {
+            metadata["dirtyRevision"] = json!(format!("{}-dirty", git.rev));
+        } else {
+            metadata["revision"] = json!(&git.rev);
+        }
+    }
 
     if let Some(desc) = description {
         metadata["description"] = json!(desc);
     }
 
-    if let Some(lm) = last_modified {
+    if let Some(lm) = effective_last_modified {
         metadata["lastModified"] = json!(lm);
     }
 
-    if !locks.is_null() && locks.get("nodes").is_some() {
-        metadata["locks"] = locks;
-    }
+    // Always include locks structure (matches nix behavior)
+    metadata["locks"] = locks;
 
     Ok(metadata)
+}
+
+/// Get git repository info for a path, if it's in a git repo.
+fn get_git_info(path: &Path) -> Option<GitInfo> {
+    let repo = git2::Repository::discover(path).ok()?;
+
+    let head = repo.head().ok()?;
+    let commit = head.peel_to_commit().ok()?;
+
+    let rev = commit.id().to_string();
+    let short_rev = if rev.len() >= 7 {
+        rev[..7].to_string()
+    } else {
+        rev.clone()
+    };
+
+    // Check if the working tree is dirty
+    let statuses = repo.statuses(None).ok()?;
+    let is_dirty = statuses.iter().any(|s| {
+        let status = s.status();
+        // Check for any modifications (staged or unstaged)
+        status.intersects(
+            git2::Status::INDEX_NEW
+                | git2::Status::INDEX_MODIFIED
+                | git2::Status::INDEX_DELETED
+                | git2::Status::INDEX_RENAMED
+                | git2::Status::INDEX_TYPECHANGE
+                | git2::Status::WT_NEW
+                | git2::Status::WT_MODIFIED
+                | git2::Status::WT_DELETED
+                | git2::Status::WT_TYPECHANGE
+                | git2::Status::WT_RENAMED,
+        )
+    });
+
+    let last_modified = Some(commit.time().seconds() as u64);
+
+    Some(GitInfo {
+        rev,
+        short_rev,
+        is_dirty,
+        last_modified,
+    })
 }
 
 /// Extract description from flake.nix using nix eval

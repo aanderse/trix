@@ -291,11 +291,12 @@ fn metadata_empty_flake() {
     assert!(metadata.get("locked").is_some());
     assert!(metadata.get("original").is_some());
 
-    // Should NOT have locks (no flake.lock)
-    assert!(
-        metadata.get("locks").is_none() || metadata["locks"].is_null(),
-        "empty flake should not have locks"
-    );
+    // Should have a minimal locks structure (matching nix behavior)
+    // Even flakes without flake.lock get a minimal locks structure with just root
+    assert!(metadata.get("locks").is_some(), "should have locks structure");
+    let locks = &metadata["locks"];
+    assert!(locks.get("nodes").is_some(), "locks should have nodes");
+    assert!(locks.get("root").is_some(), "locks should have root");
 }
 
 /// Test: Flake without description
