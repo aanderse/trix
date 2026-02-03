@@ -22,6 +22,31 @@ use crate::lock::{FlakeLock, InputRef, LockedRef};
 // Evaluation & Building
 //=============================================================================
 
+/// Information about a derivation, including which outputs to install.
+#[derive(Debug, Clone)]
+pub struct DrvInfo {
+    /// Path to the .drv file in the nix store.
+    pub drv_path: String,
+    /// Which outputs to install (from meta.outputsToInstall, defaults to ["out"]).
+    pub outputs_to_install: Vec<String>,
+}
+
+impl std::fmt::Display for DrvInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.drv_path)
+    }
+}
+
+impl DrvInfo {
+    /// Create a DrvInfo with default outputs (just "out").
+    pub fn with_default_outputs(drv_path: String) -> Self {
+        Self {
+            drv_path,
+            outputs_to_install: vec!["out".to_string()],
+        }
+    }
+}
+
 /// Evaluate a Nix expression and return the result as JSON.
 ///
 /// Uses `nix eval --json --impure --expr` (never enters flake context).
@@ -223,16 +248,88 @@ pub fn eval_to_drv(expr: &str, source_name: &str) -> Result<String> {
     Ok(drv_path)
 }
 
+/// Evaluate a Nix expression to DrvInfo (drv path + outputsToInstall).
+///
+/// This evaluates both `.drvPath` and `.meta.outputsToInstall` to determine
+/// which outputs should be built, matching `nix build` behavior.
+#[instrument(level = "debug", skip(expr), fields(expr_len = expr.len()))]
+pub fn eval_to_drv_info(expr: &str, source_name: &str) -> Result<DrvInfo> {
+    debug!("evaluating expression to DrvInfo ({} bytes)", expr.len());
+    trace!("expression source: {}", source_name);
+    trace!("full expression:\n{}", expr);
+
+    // Evaluate both drvPath and meta.outputsToInstall in a single nix eval call.
+    // This matches how `nix build` determines which outputs to build.
+    let info_expr = format!(
+        r#"let drv = ({}); in builtins.toJSON {{
+            drvPath = drv.drvPath;
+            outputsToInstall = drv.meta.outputsToInstall or [ drv.outputName or "out" ];
+        }}"#,
+        expr
+    );
+
+    let output = Command::new("nix")
+        .args(["eval", "--raw", "--impure", "--expr", &info_expr])
+        .output()
+        .context("failed to execute nix eval")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        debug!("nix eval failed with stderr:\n{}", stderr);
+        bail!("evaluation failed: {}", stderr.trim());
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let info: serde_json::Value = serde_json::from_str(&json_str)
+        .context("failed to parse DrvInfo JSON")?;
+
+    let drv_path = info["drvPath"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing drvPath in eval result"))?
+        .to_string();
+
+    let outputs_to_install: Vec<String> = info["outputsToInstall"]
+        .as_array()
+        .ok_or_else(|| anyhow!("missing outputsToInstall in eval result"))?
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+
+    debug!("evaluated to derivation: {}, outputs: {:?}", drv_path, outputs_to_install);
+
+    if !drv_path.ends_with(".drv") {
+        bail!("nix eval returned invalid path (expected .drv): {}", drv_path);
+    }
+
+    if outputs_to_install.is_empty() {
+        bail!("outputsToInstall is empty");
+    }
+
+    Ok(DrvInfo {
+        drv_path,
+        outputs_to_install,
+    })
+}
+
 /// Build a derivation and return the output path.
 ///
 /// Uses `nix build` with a .drv store path (no flake context).
-#[instrument(level = "debug", fields(drv = %drv_path))]
-pub fn build_drv(drv_path: &str) -> Result<String> {
+/// Builds only the specified outputs (from meta.outputsToInstall).
+/// Returns the first output path.
+#[instrument(level = "debug", fields(drv = %drv_path, outputs = ?outputs))]
+pub fn build_drv(drv_path: &str, outputs: &[String]) -> Result<String> {
     debug!("building derivation with nix build");
 
     // Build the derivation directly from its store path.
-    // ^* means "all outputs". --no-link avoids creating result symlinks.
-    let installable = format!("{}^*", drv_path);
+    // Use ^output1,output2,... syntax to build only the specified outputs.
+    // This matches `nix build` behavior which uses meta.outputsToInstall.
+    let outputs_suffix = if outputs.is_empty() {
+        "out".to_string() // fallback to "out" if no outputs specified
+    } else {
+        outputs.join(",")
+    };
+    let installable = format!("{}^{}", drv_path, outputs_suffix);
+
     let output = Command::new("nix")
         .args(["build", &installable, "--no-link", "--print-out-paths"])
         .output()
@@ -246,7 +343,8 @@ pub fn build_drv(drv_path: &str) -> Result<String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // nix build --print-out-paths outputs one path per line
+    // nix build --print-out-paths outputs one path per line.
+    // Return the first output path (typically "out").
     let output_path = stdout
         .lines()
         .next()
@@ -445,13 +543,14 @@ pub fn prefetch_all_inputs(lock: &FlakeLock) -> Result<HashMap<String, String>> 
 /// 4. Call the flake's outputs function
 ///
 /// This ensures the local flake is NEVER copied to /nix/store.
+/// Returns DrvInfo containing both the drv path and outputs to install.
 #[instrument(level = "debug", skip(lock), fields(attr = ?attr_path))]
 pub fn generate_and_eval_local_flake(
     flake_path: &Path,
     lock: &FlakeLock,
     attr_path: &[String],
     input_overrides: &HashMap<String, String>,
-) -> Result<String> {
+) -> Result<DrvInfo> {
     debug!("generating expression for local flake: {}", flake_path.display());
 
     // Step 1: Prefetch all inputs to the store
@@ -486,9 +585,9 @@ pub fn generate_and_eval_local_flake(
         &store_paths,
     )?;
 
-    // Step 3: Evaluate the expression to get .drv path
+    // Step 3: Evaluate the expression to get .drv path and outputsToInstall
     let source_name = format!("{}#{}", flake_path.display(), attr_path.join("."));
-    eval_to_drv(&expr, &source_name)
+    eval_to_drv_info(&expr, &source_name)
 }
 
 /// Generate a Nix expression for evaluating a local flake attribute.
@@ -1227,8 +1326,8 @@ pub fn eval_flake_checks(
         ];
 
         match generate_and_eval_local_flake(flake_path, lock, &attr_path, &HashMap::new()) {
-            Ok(drv_path) => {
-                results.push((name.clone(), drv_path));
+            Ok(drv_info) => {
+                results.push((name.clone(), drv_info.drv_path));
             }
             Err(e) => {
                 debug!("failed to evaluate check {}: {}", name, e);

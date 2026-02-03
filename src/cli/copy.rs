@@ -52,7 +52,7 @@ pub fn run(args: CopyArgs) -> Result<()> {
     debug!(?candidates, "expanded attribute candidates");
 
     // Try each candidate until one succeeds
-    let (attr_path, drv_path) = {
+    let (attr_path, drv_info) = {
         let mut found = None;
 
         for candidate in &candidates {
@@ -67,9 +67,9 @@ pub fn run(args: CopyArgs) -> Result<()> {
             );
 
             match result {
-                Ok(drv_path) => {
+                Ok(info) => {
                     info!("evaluating {}", eval_target);
-                    found = Some((candidate.clone(), drv_path));
+                    found = Some((candidate.clone(), info));
                     break;
                 }
                 Err(e) => {
@@ -89,13 +89,13 @@ pub fn run(args: CopyArgs) -> Result<()> {
         })?
     };
 
-    debug!(attr = %attr_path.join("."), drv = %drv_path, "found attribute");
+    debug!(attr = %attr_path.join("."), drv = %drv_info.drv_path, "found attribute");
 
     // Step 4: Build to get the store path
-    info!("building {}", drv_path);
-    let build_status = progress::building(&drv_path);
+    info!("building {}", drv_info.drv_path);
+    let build_status = progress::building(&drv_info.drv_path);
 
-    let store_path = eval::build_drv(&drv_path).context("build failed")?;
+    let store_path = eval::build_drv(&drv_info.drv_path, &drv_info.outputs_to_install).context("build failed")?;
 
     build_status.finish_and_clear();
 

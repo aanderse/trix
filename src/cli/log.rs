@@ -67,9 +67,9 @@ pub fn run(args: LogArgs) -> Result<()> {
                 candidate,
                 &HashMap::new(),
             ) {
-                Ok(drv) => {
-                    debug!(attr = %candidate.join("."), drv = %drv, "found derivation");
-                    found = Some(drv);
+                Ok(drv_info) => {
+                    debug!(attr = %candidate.join("."), drv = %drv_info.drv_path, "found derivation");
+                    found = Some(drv_info.drv_path);
                     break;
                 }
                 Err(e) => {

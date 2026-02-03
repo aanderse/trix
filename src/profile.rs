@@ -399,8 +399,8 @@ fn try_build_candidate(
     attr_path: &[String],
     input_overrides: &HashMap<String, String>,
 ) -> Result<String> {
-    // Evaluate to get drv path
-    let drv_path = eval::generate_and_eval_local_flake(
+    // Evaluate to get drv path and outputs to install
+    let drv_info = eval::generate_and_eval_local_flake(
         flake_dir,
         lock,
         attr_path,
@@ -408,13 +408,13 @@ fn try_build_candidate(
     )
     .context("failed to evaluate derivation")?;
 
-    debug!(drv = %drv_path, "got derivation path");
+    debug!(drv = %drv_info.drv_path, "got derivation path");
 
-    // Build it
-    info!("building {}", drv_path);
-    let build_status = progress::building(&drv_path);
+    // Build it using the correct outputs
+    info!("building {}", drv_info.drv_path);
+    let build_status = progress::building(&drv_info.drv_path);
 
-    let store_path = eval::build_drv(&drv_path).context("build failed")?;
+    let store_path = eval::build_drv(&drv_info.drv_path, &drv_info.outputs_to_install).context("build failed")?;
 
     build_status.finish_and_clear();
 

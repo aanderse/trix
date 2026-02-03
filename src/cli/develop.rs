@@ -244,9 +244,9 @@ fn run_flake_mode(args: &DevelopArgs) -> Result<()> {
         );
 
         match result {
-            Ok(path) => {
+            Ok(drv_info) => {
                 status.finish_and_clear();
-                drv_path_str = Some(path);
+                drv_path_str = Some(drv_info.drv_path);
                 successful_attr = Some(attr_path.join("."));
                 break;
             }

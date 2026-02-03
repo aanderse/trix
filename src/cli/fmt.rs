@@ -51,7 +51,7 @@ pub fn run(args: FmtArgs) -> Result<()> {
 
     let status = progress::evaluating(&eval_target);
 
-    let drv_path = eval::generate_and_eval_local_flake(
+    let drv_info = eval::generate_and_eval_local_flake(
         &flake_path,
         &lock,
         &attr_path,
@@ -60,13 +60,13 @@ pub fn run(args: FmtArgs) -> Result<()> {
     .context("failed to evaluate formatter - does the flake have a formatter output?")?;
 
     status.finish_and_clear();
-    debug!(drv = %drv_path, "got derivation path");
+    debug!(drv = %drv_info.drv_path, "got derivation path");
 
     // Step 4: Build the formatter
-    info!("building {}", drv_path);
-    let build_status = progress::building(&drv_path);
+    info!("building {}", drv_info.drv_path);
+    let build_status = progress::building(&drv_info.drv_path);
 
-    let store_path = eval::build_drv(&drv_path)?;
+    let store_path = eval::build_drv(&drv_info.drv_path, &drv_info.outputs_to_install)?;
 
     build_status.finish_and_clear();
 

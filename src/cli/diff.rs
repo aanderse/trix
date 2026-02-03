@@ -555,9 +555,9 @@ fn resolve_to_drv(arg: &str) -> Result<String> {
                     candidate,
                     &HashMap::new(),
                 ) {
-                    Ok(drv_path) => {
+                    Ok(drv_info) => {
                         debug!(attr = %candidate.join("."), "found attribute");
-                        return Ok(drv_path);
+                        return Ok(drv_info.drv_path);
                     }
                     Err(e) => {
                         trace!("candidate {} failed: {}", candidate.join("."), e);

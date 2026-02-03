@@ -96,13 +96,13 @@ pub fn run(args: RunArgs) -> Result<()> {
             );
 
             match result {
-                Ok(drv_path) => {
-                    debug!(attr = %candidate.join("."), drv = %drv_path, "found package");
+                Ok(drv_info) => {
+                    debug!(attr = %candidate.join("."), drv = %drv_info.drv_path, "found package");
 
                     info!("building {}", candidate.join("."));
-                    let build_status = progress::building(&drv_path);
+                    let build_status = progress::building(&drv_info.drv_path);
 
-                    let store_path = eval::build_drv(&drv_path)
+                    let store_path = eval::build_drv(&drv_info.drv_path, &drv_info.outputs_to_install)
                         .context("build failed")?;
 
                     build_status.finish_and_clear();

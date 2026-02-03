@@ -261,3 +261,159 @@ fn eval_does_not_copy_flake_to_store() {
         found_paths
     );
 }
+
+/// Test that trix build correctly handles multi-output derivations.
+///
+/// This is a regression test for a bug where trix would build all outputs with `^*`
+/// and take the first one alphabetically, which could be wrong (e.g., "dist" before "out").
+/// The fix uses `meta.outputsToInstall` to determine which outputs to build.
+#[test]
+fn build_multi_output_derivation_selects_correct_output() {
+    use uuid::Uuid;
+
+    let uuid = Uuid::new_v4().to_string();
+    let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+    let flake_dir = temp_dir.path();
+
+    // Create a flake with a multi-output derivation where "dist" comes before "out" alphabetically.
+    // The derivation writes different content to each output so we can verify which was selected.
+    let flake_nix = format!(
+        r#"{{
+  inputs = {{ }};
+  outputs = {{ self }}: {{
+    packages.x86_64-linux.default = derivation {{
+      name = "multi-output-test-{uuid}";
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      # Two outputs: "dist" and "out". Alphabetically, "dist" < "out".
+      outputs = [ "out" "dist" ];
+      args = [ "-c" ''
+        echo "THIS_IS_OUT" > $out
+        echo "THIS_IS_DIST" > $dist
+      '' ];
+      # meta.outputsToInstall defaults to ["out"] when not specified
+    }};
+  }};
+}}"#,
+        uuid = &uuid[..8]
+    );
+    fs::write(flake_dir.join("flake.nix"), flake_nix).expect("failed to write flake.nix");
+
+    let flake_lock = r#"{
+  "nodes": {
+    "root": {}
+  },
+  "root": "root",
+  "version": 7
+}"#;
+    fs::write(flake_dir.join("flake.lock"), flake_lock).expect("failed to write flake.lock");
+
+    // Build and capture the output path
+    let flake_ref = format!("{}#default", flake_dir.display());
+    let output = Command::new(trix_bin())
+        .args(["build", "--no-link", &flake_ref])
+        .output()
+        .expect("failed to run trix build");
+
+    assert!(
+        output.status.success(),
+        "trix build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The output should be printed to stdout - get the store path
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let store_path = stdout.lines().last().expect("no output path");
+
+    // Verify we got the "out" output (no -dist suffix)
+    assert!(
+        !store_path.contains("-dist"),
+        "FAIL: trix built the wrong output! Got '{}' which appears to be the 'dist' output. \
+         Expected the 'out' output (no -dist suffix).",
+        store_path
+    );
+
+    // Also verify the content is correct
+    let content = fs::read_to_string(store_path).expect("failed to read output");
+    assert!(
+        content.trim() == "THIS_IS_OUT",
+        "FAIL: Output content is '{}', expected 'THIS_IS_OUT'. \
+         This means the wrong output was selected.",
+        content.trim()
+    );
+}
+
+/// Test that trix build respects custom meta.outputsToInstall.
+#[test]
+fn build_respects_custom_outputs_to_install() {
+    use uuid::Uuid;
+
+    let uuid = Uuid::new_v4().to_string();
+    let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+    let flake_dir = temp_dir.path();
+
+    // Create a flake where meta.outputsToInstall specifies "dist" as the output to install
+    let flake_nix = format!(
+        r#"{{
+  inputs = {{ }};
+  outputs = {{ self }}: {{
+    packages.x86_64-linux.default = (derivation {{
+      name = "custom-outputs-test-{uuid}";
+      system = "x86_64-linux";
+      builder = "/bin/sh";
+      outputs = [ "out" "dist" ];
+      args = [ "-c" ''
+        echo "THIS_IS_OUT" > $out
+        echo "THIS_IS_DIST" > $dist
+      '' ];
+    }}) // {{
+      # Override to make "dist" the default output to install
+      meta.outputsToInstall = [ "dist" ];
+    }};
+  }};
+}}"#,
+        uuid = &uuid[..8]
+    );
+    fs::write(flake_dir.join("flake.nix"), flake_nix).expect("failed to write flake.nix");
+
+    let flake_lock = r#"{
+  "nodes": {
+    "root": {}
+  },
+  "root": "root",
+  "version": 7
+}"#;
+    fs::write(flake_dir.join("flake.lock"), flake_lock).expect("failed to write flake.lock");
+
+    // Build and capture the output path
+    let flake_ref = format!("{}#default", flake_dir.display());
+    let output = Command::new(trix_bin())
+        .args(["build", "--no-link", &flake_ref])
+        .output()
+        .expect("failed to run trix build");
+
+    assert!(
+        output.status.success(),
+        "trix build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let store_path = stdout.lines().last().expect("no output path");
+
+    // With meta.outputsToInstall = ["dist"], we should get the dist output
+    assert!(
+        store_path.contains("-dist"),
+        "FAIL: Expected 'dist' output (with -dist suffix) but got '{}'. \
+         meta.outputsToInstall was not respected.",
+        store_path
+    );
+
+    // Verify content
+    let content = fs::read_to_string(store_path).expect("failed to read output");
+    assert!(
+        content.trim() == "THIS_IS_DIST",
+        "FAIL: Output content is '{}', expected 'THIS_IS_DIST'.",
+        content.trim()
+    );
+}

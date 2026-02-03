@@ -127,9 +127,11 @@ fn run_file_mode(args: &BuildArgs, file_path: &PathBuf) -> Result<()> {
     debug!(drv = %drv_path_str, "got derivation path");
 
     // Build the derivation using subprocess
+    // For file-based builds, use default output "out" since there's no meta.outputsToInstall
     info!("building {}", drv_path_str);
     let status = progress::building(&drv_path_str);
-    let output_path = eval::build_drv(&drv_path_str).context("build failed")?;
+    let default_outputs = vec!["out".to_string()];
+    let output_path = eval::build_drv(&drv_path_str, &default_outputs).context("build failed")?;
     status.finish_and_clear();
 
     debug!(output = %output_path, "build completed");
@@ -263,7 +265,7 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
     }
 
     // Step 5: Try each candidate attribute using new evaluator
-    let (attr_path, drv_path_str) = {
+    let (attr_path, drv_info) = {
         let mut found = None;
 
         for candidate in &candidates {
@@ -278,9 +280,9 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
             );
 
             match result {
-                Ok(drv_path) => {
+                Ok(info) => {
                     info!("evaluating {}", eval_target);
-                    found = Some((candidate.clone(), drv_path));
+                    found = Some((candidate.clone(), info));
                     break;
                 }
                 Err(e) => {
@@ -294,12 +296,13 @@ fn run_flake_mode(args: &BuildArgs) -> Result<()> {
         })?
     };
 
-    debug!(attr = %attr_path.join("."), drv = %drv_path_str, "found attribute");
+    debug!(attr = %attr_path.join("."), drv = %drv_info.drv_path, "found attribute");
 
     // Step 6: Build the derivation using subprocess
-    info!("building {}", drv_path_str);
-    let status = progress::building(&drv_path_str);
-    let output_path = eval::build_drv(&drv_path_str).context("build failed")?;
+    // Use outputsToInstall from the derivation metadata (matching nix build behavior)
+    info!("building {}", drv_info.drv_path);
+    let status = progress::building(&drv_info.drv_path);
+    let output_path = eval::build_drv(&drv_info.drv_path, &drv_info.outputs_to_install).context("build failed")?;
     status.finish_and_clear();
 
     debug!(output = %output_path, "build completed");
