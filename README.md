@@ -155,3 +155,4 @@ RUST_LOG=trace trix build
   projects compatible with legacy Nix commands.
 - [unflake](https://codeberg.org/goldstein/unflake): An alternative dependency
   resolver & runtime for Nix flakes.
+- [with-inputs](https://github.com/vic/with-inputs): Flake compatible input resolution for projects not using flakes.
