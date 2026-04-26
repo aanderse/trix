@@ -1,5 +1,6 @@
+use crate::cli::common::CommonArgs;
 use crate::flake::{ensure_lock, resolve_attr_path, resolve_installable};
-use crate::nix::{get_system, run_nix_shell, ShellOptions};
+use crate::nix::{apply_common_args, get_system, run_nix_shell, ShellOptions};
 use anyhow::{Context, Result};
 use clap::Args;
 
@@ -25,29 +26,8 @@ pub struct DevelopArgs {
     #[arg(long = "script-args", hide = true, num_args = 0..)]
     pub script_args: Vec<String>,
 
-    /// Pass --arg NAME EXPR to nix
-    #[arg(long = "arg", value_names = &["NAME", "EXPR"], num_args = 2)]
-    pub extra_args: Vec<String>,
-
-    /// Pass --argstr NAME VALUE to nix
-    #[arg(long = "argstr", value_names = &["NAME", "VALUE"], num_args = 2)]
-    pub extra_argstrs: Vec<String>,
-
-    /// Use specified store URL
-    #[arg(long)]
-    pub store: Option<String>,
-}
-
-fn parse_arg_pairs(args: &[String]) -> Vec<(String, String)> {
-    args.chunks(2)
-        .filter_map(|chunk| {
-            if chunk.len() == 2 {
-                Some((chunk[0].clone(), chunk[1].clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 /// Build the command string for running an interpreter with a script.
@@ -70,6 +50,8 @@ fn build_interpreter_command(interpreter: &str, script: &str, script_args: &[Str
 
 /// Enter a development shell from flake.nix
 pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
+    let common = args.common.to_common_options();
+
     // Determine the effective command to run
     // If -i (interpreter) is specified with a script, build the command
     let effective_command = if let Some(ref interpreter) = args.interpreter {
@@ -101,17 +83,7 @@ pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
             cmd.args(["--command", c]);
         }
 
-        if let Some(s) = &args.store {
-            cmd.args(["--store", s]);
-        }
-
-        for (name, expr) in parse_arg_pairs(&args.extra_args) {
-            cmd.args(["--arg", &name, &expr]);
-        }
-
-        for (name, value) in parse_arg_pairs(&args.extra_argstrs) {
-            cmd.args(["--argstr", &name, &value]);
-        }
+        apply_common_args(&mut cmd, &common);
 
         return cmd.exec();
     }
@@ -130,9 +102,6 @@ pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
 
     let options = ShellOptions {
         command: effective_command,
-        extra_args: parse_arg_pairs(&args.extra_args),
-        extra_argstrs: parse_arg_pairs(&args.extra_argstrs),
-        store: args.store.clone(),
         bash_prompt: nix_config["bash-prompt"].as_str().map(|s| s.to_string()),
         bash_prompt_prefix: nix_config["bash-prompt-prefix"]
             .as_str()
@@ -140,6 +109,7 @@ pub fn cmd_develop(args: DevelopArgs) -> Result<()> {
         bash_prompt_suffix: nix_config["bash-prompt-suffix"]
             .as_str()
             .map(|s| s.to_string()),
+        common,
     };
 
     run_nix_shell(flake_dir, &attr, &options)

@@ -1,3 +1,4 @@
+use crate::cli::common::CommonArgs;
 use crate::flake::{ensure_lock, resolve_installable};
 use crate::nix::{run_nix_eval, EvalOptions};
 use anyhow::{Context, Result};
@@ -25,45 +26,23 @@ pub struct EvalArgs {
     #[arg(long)]
     pub apply: Option<String>,
 
-    /// Pass --arg NAME EXPR to nix
-    #[arg(long = "arg", value_names = &["NAME", "EXPR"], num_args = 2)]
-    pub extra_args: Vec<String>,
-
-    /// Pass --argstr NAME VALUE to nix
-    #[arg(long = "argstr", value_names = &["NAME", "VALUE"], num_args = 2)]
-    pub extra_argstrs: Vec<String>,
-
-    /// Use specified store URL
-    #[arg(long)]
-    pub store: Option<String>,
-}
-
-fn parse_arg_pairs(args: &[String]) -> Vec<(String, String)> {
-    args.chunks(2)
-        .filter_map(|chunk| {
-            if chunk.len() == 2 {
-                Some((chunk[0].clone(), chunk[1].clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 /// Evaluate a flake attribute or Nix expression
 /// Evaluate a flake attribute or Nix expression
 pub fn cmd_eval(args: EvalArgs) -> Result<()> {
+    let common = args.common.to_common_options();
+
     if let Some(expression) = &args.expr {
         // Raw expression evaluation
         let options = EvalOptions {
             output_json: args.json,
             raw: args.raw,
             apply_fn: args.apply.clone(),
-            extra_args: parse_arg_pairs(&args.extra_args),
-            extra_argstrs: parse_arg_pairs(&args.extra_argstrs),
+            common,
             expr: Some(expression.clone()),
-            store: args.store.clone(),
-            quiet: false,
         };
 
         let result = run_nix_eval(None, "", &options)?;
@@ -94,15 +73,15 @@ pub fn cmd_eval(args: EvalArgs) -> Result<()> {
             cmd.args(["--apply", f]);
         }
 
-        if let Some(s) = &args.store {
+        if let Some(s) = &common.store {
             cmd.args(["--store", s]);
         }
 
-        for (name, expr) in parse_arg_pairs(&args.extra_args) {
+        for (name, expr) in &common.extra_args {
             cmd.args(["--arg", &name, &expr]);
         }
 
-        for (name, value) in parse_arg_pairs(&args.extra_argstrs) {
+        for (name, value) in &common.extra_argstrs {
             cmd.args(["--argstr", &name, &value]);
         }
 
@@ -118,11 +97,8 @@ pub fn cmd_eval(args: EvalArgs) -> Result<()> {
         output_json: args.json,
         raw: args.raw,
         apply_fn: args.apply.clone(),
-        extra_args: parse_arg_pairs(&args.extra_args),
-        extra_argstrs: parse_arg_pairs(&args.extra_argstrs),
         expr: None,
-        store: args.store.clone(),
-        quiet: false,
+        common,
     };
 
     let result = run_nix_eval(Some(flake_dir), &resolved.attr_part, &options)?;

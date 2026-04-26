@@ -1,4 +1,5 @@
 use super::common::build_resolved_attribute;
+use crate::cli::common::CommonArgs;
 use crate::flake::{ensure_lock, resolve_attr_path, resolve_installable};
 use crate::nix::{get_system, BuildOptions};
 use anyhow::{Context, Result};
@@ -14,33 +15,14 @@ pub struct RunArgs {
     #[arg(last = true)]
     pub args: Vec<String>,
 
-    /// Pass --arg NAME EXPR to nix
-    #[arg(long = "arg", value_names = &["NAME", "EXPR"], num_args = 2)]
-    pub extra_args: Vec<String>,
-
-    /// Pass --argstr NAME VALUE to nix
-    #[arg(long = "argstr", value_names = &["NAME", "VALUE"], num_args = 2)]
-    pub extra_argstrs: Vec<String>,
-
-    /// Use specified store URL
-    #[arg(long)]
-    pub store: Option<String>,
-}
-
-fn parse_arg_pairs(args: &[String]) -> Vec<(String, String)> {
-    args.chunks(2)
-        .filter_map(|chunk| {
-            if chunk.len() == 2 {
-                Some((chunk[0].clone(), chunk[1].clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 /// Build and run a package from flake.nix
 pub fn cmd_run(args: RunArgs) -> Result<()> {
+    let common = args.common.to_common_options();
+
     let resolved = resolve_installable(&args.installable);
 
     if !resolved.is_local {
@@ -51,7 +33,7 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
         let mut cmd = crate::command::NixCommand::new("nix");
         cmd.args(["run", &full_ref]);
 
-        if let Some(s) = &args.store {
+        if let Some(s) = &common.store {
             cmd.args(["--store", s]);
         }
 
@@ -94,9 +76,7 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
         // It's a package - build and get the executable
         let options = BuildOptions {
             out_link: None,
-            extra_args: parse_arg_pairs(&args.extra_args),
-            extra_argstrs: parse_arg_pairs(&args.extra_argstrs),
-            store: args.store.clone(),
+            common,
         };
 
         let store_path = build_resolved_attribute(&resolved, &pkg_attr, &options, true)?
