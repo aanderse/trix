@@ -1,6 +1,7 @@
 use super::common::build_resolved_attribute;
+use crate::cli::common::CommonArgs;
 use crate::flake::{resolve_attr_path, resolve_installable};
-use crate::nix::{get_system, BuildOptions};
+use crate::nix::{apply_common_args, get_system, BuildOptions, CommonOptions};
 use anyhow::Result;
 use clap::Args;
 
@@ -27,32 +28,13 @@ pub struct BuildArgs {
     #[arg(short = 'f', long = "file")]
     pub nix_file: Option<String>,
 
-    /// Pass --arg NAME EXPR to nix
-    #[arg(long = "arg", value_names = &["NAME", "EXPR"], num_args = 2)]
-    pub extra_args: Vec<String>,
-
-    /// Pass --argstr NAME VALUE to nix
-    #[arg(long = "argstr", value_names = &["NAME", "VALUE"], num_args = 2)]
-    pub extra_argstrs: Vec<String>,
-
-    /// Use specified store URL
-    #[arg(long)]
-    pub store: Option<String>,
-}
-
-fn parse_arg_pairs(args: &[String]) -> Vec<(String, String)> {
-    args.chunks(2)
-        .filter_map(|chunk| {
-            if chunk.len() == 2 {
-                Some((chunk[0].clone(), chunk[1].clone()))
-            } else {
-                None
-            }
-        })
-        .collect()
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 pub fn cmd_build(args: BuildArgs) -> Result<()> {
+    let common = args.common.to_common_options();
+
     // If -f is specified, bypass flake machinery entirely
     if let Some(ref file) = args.nix_file {
         return cmd_build_legacy(
@@ -63,9 +45,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<()> {
             } else {
                 Some(&args.out_link)
             },
-            parse_arg_pairs(&args.extra_args),
-            parse_arg_pairs(&args.extra_argstrs),
-            args.store.as_deref(),
+            &common,
         );
     }
 
@@ -94,17 +74,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<()> {
                 cmd.args(["-o", link]);
             }
 
-            if let Some(s) = &args.store {
-                cmd.args(["--store", s]);
-            }
-
-            for (name, expr) in parse_arg_pairs(&args.extra_args) {
-                cmd.args(["--arg", &name, &expr]);
-            }
-
-            for (name, value) in parse_arg_pairs(&args.extra_argstrs) {
-                cmd.args(["--argstr", &name, &value]);
-            }
+            apply_common_args(&mut cmd, &common);
 
             return cmd.run();
         } else {
@@ -119,9 +89,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<()> {
                 BuildSource::Expr(expr),
                 &resolved.attr_part,
                 out_link,
-                parse_arg_pairs(&args.extra_args),
-                parse_arg_pairs(&args.extra_argstrs),
-                args.store.as_deref(),
+                &common,
             );
         }
     }
@@ -137,9 +105,7 @@ pub fn cmd_build(args: BuildArgs) -> Result<()> {
         } else {
             Some(args.out_link.clone())
         },
-        extra_args: parse_arg_pairs(&args.extra_args),
-        extra_argstrs: parse_arg_pairs(&args.extra_argstrs),
-        store: args.store.clone(),
+        common,
     };
 
     build_resolved_attribute(&resolved, &attr, &options, false)?;
@@ -152,9 +118,7 @@ fn cmd_build_legacy(
     source: BuildSource,
     attr: &str,
     out_link: Option<&str>,
-    extra_args: Vec<(String, String)>,
-    extra_argstrs: Vec<(String, String)>,
-    store: Option<&str>,
+    common: &CommonOptions,
 ) -> Result<()> {
     let mut cmd = crate::command::NixCommand::new("nix-build");
 
@@ -176,17 +140,7 @@ fn cmd_build_legacy(
         }
     }
 
-    for (name, expr) in &extra_args {
-        cmd.args(["--arg", name, expr]);
-    }
-
-    for (name, value) in &extra_argstrs {
-        cmd.args(["--argstr", name, value]);
-    }
-
-    if let Some(s) = store {
-        cmd.args(["--store", s]);
-    }
+    apply_common_args(&mut cmd, &common);
 
     match out_link {
         Some(link) => {

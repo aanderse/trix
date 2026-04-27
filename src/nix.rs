@@ -76,6 +76,12 @@ fn find_nix_dir() -> Result<PathBuf> {
         }
     }
 
+    let parent = Path::new("/home/sergey/projects/nix/projects/trix/");
+    let dev = parent.join("src/resources");
+    if dev.join("eval.nix").exists() {
+        return Ok(dev);
+    }
+
     anyhow::bail!("Cannot find nix/ directory")
 }
 
@@ -233,24 +239,55 @@ pub fn get_store_dir() -> Result<String> {
 }
 
 /// Options shared across nix commands
-pub trait CommonNixOptions {
-    fn store(&self) -> Option<&str>;
-    fn extra_args(&self) -> &[(String, String)];
-    fn extra_argstrs(&self) -> &[(String, String)];
+#[derive(Debug, Default)]
+pub struct CommonOptions {
+    pub extra_args: Vec<(String, String)>,
+    pub extra_argstrs: Vec<(String, String)>,
+    pub store: Option<String>,
+    pub max_jobs: Option<i32>,
+    pub cores: Option<i32>,
+    pub keep_going: bool,
+    pub keep_failed: bool,
+    pub no_build_output: bool,
+    pub quiet: bool,
 }
 
 /// Helper to apply common arguments to a Nix command
-fn apply_common_args<T: CommonNixOptions>(cmd: &mut crate::command::NixCommand, options: &T) {
-    if let Some(store) = options.store() {
+pub fn apply_common_args(cmd: &mut crate::command::NixCommand, options: &CommonOptions) {
+    if let Some(store) = &options.store {
         cmd.args(["--store", store]);
     }
 
-    for (name, expr) in options.extra_args() {
+    for (name, expr) in &options.extra_args {
         cmd.args(["--arg", name, expr]);
     }
 
-    for (name, value) in options.extra_argstrs() {
+    for (name, value) in &options.extra_argstrs {
         cmd.args(["--argstr", name, value]);
+    }
+
+    if let Some(n) = &options.max_jobs {
+        cmd.args(["--max-jobs", &n.to_string()]);
+    }
+
+    if let Some(n) = &options.cores {
+        cmd.args(["--cores", &n.to_string()]);
+    }
+
+    if options.keep_going {
+        cmd.arg("--keep-going");
+    }
+
+    if options.keep_failed {
+        cmd.arg("--keep-failed");
+    }
+
+    if options.no_build_output {
+        cmd.arg("--no-build-output");
+    }
+
+    if options.quiet {
+        cmd.arg("--quiet");
     }
 }
 
@@ -258,21 +295,7 @@ fn apply_common_args<T: CommonNixOptions>(cmd: &mut crate::command::NixCommand, 
 #[derive(Debug, Default)]
 pub struct BuildOptions {
     pub out_link: Option<String>,
-    pub extra_args: Vec<(String, String)>,
-    pub extra_argstrs: Vec<(String, String)>,
-    pub store: Option<String>,
-}
-
-impl CommonNixOptions for BuildOptions {
-    fn store(&self) -> Option<&str> {
-        self.store.as_deref()
-    }
-    fn extra_args(&self) -> &[(String, String)] {
-        &self.extra_args
-    }
-    fn extra_argstrs(&self) -> &[(String, String)] {
-        &self.extra_argstrs
-    }
+    pub common: CommonOptions,
 }
 
 /// Run nix-build with eval.nix wrapper.
@@ -295,7 +318,7 @@ pub fn run_nix_build(
         cmd.args(["-A", attr]);
     }
 
-    apply_common_args(&mut cmd, options);
+    apply_common_args(&mut cmd, &options.common);
 
     match &options.out_link {
         Some(link) => {
@@ -318,24 +341,10 @@ pub fn run_nix_build(
 #[derive(Debug, Default)]
 pub struct ShellOptions {
     pub command: Option<String>,
-    pub extra_args: Vec<(String, String)>,
-    pub extra_argstrs: Vec<(String, String)>,
-    pub store: Option<String>,
     pub bash_prompt: Option<String>,
     pub bash_prompt_prefix: Option<String>,
     pub bash_prompt_suffix: Option<String>,
-}
-
-impl CommonNixOptions for ShellOptions {
-    fn store(&self) -> Option<&str> {
-        self.store.as_deref()
-    }
-    fn extra_args(&self) -> &[(String, String)] {
-        &self.extra_args
-    }
-    fn extra_argstrs(&self) -> &[(String, String)] {
-        &self.extra_argstrs
-    }
+    pub common: CommonOptions,
 }
 
 /// Run nix-shell with eval.nix wrapper. Replaces current process.
@@ -345,7 +354,7 @@ pub fn run_nix_shell(flake_dir: &Path, attr: &str, options: &ShellOptions) -> Re
     let mut cmd = crate::command::NixCommand::new("nix-shell");
     setup_eval_command(&mut cmd, &nix_dir, flake_dir, attr);
 
-    apply_common_args(&mut cmd, options);
+    apply_common_args(&mut cmd, &options.common);
 
     if let Some(ref command) = options.command {
         cmd.args(["--command", command]);
@@ -391,23 +400,8 @@ pub struct EvalOptions {
     pub output_json: bool,
     pub raw: bool,
     pub apply_fn: Option<String>,
-    pub extra_args: Vec<(String, String)>,
-    pub extra_argstrs: Vec<(String, String)>,
     pub expr: Option<String>,
-    pub store: Option<String>,
-    pub quiet: bool,
-}
-
-impl CommonNixOptions for EvalOptions {
-    fn store(&self) -> Option<&str> {
-        self.store.as_deref()
-    }
-    fn extra_args(&self) -> &[(String, String)] {
-        &self.extra_args
-    }
-    fn extra_argstrs(&self) -> &[(String, String)] {
-        &self.extra_argstrs
-    }
+    pub common: CommonOptions,
 }
 
 /// Evaluate a flake attribute or raw expression and return the result.
@@ -461,7 +455,7 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
         &nix_expr,
     ]);
 
-    apply_common_args(&mut cmd, options);
+    apply_common_args(&mut cmd, &options.common);
 
     if options.output_json {
         cmd.arg("--json");
@@ -478,7 +472,7 @@ pub fn run_nix_eval(flake_dir: Option<&Path>, attr: &str, options: &EvalOptions)
             Ok(result)
         }
         Err(e) => {
-            if !options.quiet {
+            if !options.common.quiet {
                 tracing::error!("{}", e);
             }
             Err(e)

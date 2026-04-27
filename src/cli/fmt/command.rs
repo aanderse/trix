@@ -1,6 +1,6 @@
 use super::common::build_resolved_attribute;
 use crate::flake::resolve_installable;
-use crate::nix::{get_package_main_program, get_system, BuildOptions};
+use crate::nix::{get_package_main_program, get_system, BuildOptions, CommonOptions};
 use anyhow::{Context, Result};
 use clap::Args;
 
@@ -60,8 +60,10 @@ pub fn cmd_fmt(args: FmtArgs) -> Result<()> {
     // Build the formatter
     let build_options = BuildOptions {
         out_link: None,
-        store: args.store.clone(),
-        ..Default::default()
+        common: CommonOptions {
+            store: args.store.clone(),
+            ..Default::default()
+        },
     };
 
     let store_path = build_resolved_attribute(&resolved, &attr, &build_options, true)?
