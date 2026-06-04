@@ -76,12 +76,6 @@ fn find_nix_dir() -> Result<PathBuf> {
         }
     }
 
-    let parent = Path::new("/home/sergey/projects/nix/projects/trix/");
-    let dev = parent.join("src/resources");
-    if dev.join("eval.nix").exists() {
-        return Ok(dev);
-    }
-
     anyhow::bail!("Cannot find nix/ directory")
 }
 
