@@ -59,7 +59,7 @@ pub fn get_nix_dir() -> Result<PathBuf> {
 }
 
 fn find_nix_dir() -> Result<PathBuf> {
-    let exe = env::current_exe().context("Cannot determine executable path")?;
+    let exe = env::current_exe().context("Cannot determine executable path")?.canonicalize()?;
 
     // Walk up from executable looking for nix files
     for parent in exe.ancestors().skip(1) {
