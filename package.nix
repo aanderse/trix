@@ -1,6 +1,8 @@
 {
   lib,
   rustPlatform,
+  pkg-config,
+  libgit2,
   versionCheckHook,
 }:
 
@@ -19,7 +21,10 @@ rustPlatform.buildRustPackage {
     ];
   };
 
-  cargoHash = "sha256-+WqqNTcl0Q9UlGRGJePI9HEeBwZ+wOhE8dPi+tWytz0=";
+  cargoHash = "sha256-BL6XaVwbxAPoujfTXTF1a5pOSRBVU9DEr5WyrfGQXkI=";
+
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ libgit2 ];
 
   dontUseCargoParallelTests = true;
 
